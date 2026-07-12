@@ -1,0 +1,33 @@
+tiziano_local:
+  paths:
+    src_path: "/Users/tizianocausin/Desktop/IT_recap/python_scripts/src"
+    livingstone_lab: "/Volumes/LivingstoneLab"
+    data_formatted: "/Volumes/LivingstoneLab/Data/Data-Formatted"
+    data_neuropixels: "/Volumes/LivingstoneLab/Data/Data-Neuropixels-Preprocessed"
+    useful_stuff_path: "/Users/tizianocausin/Desktop/useful_stuff/python_scripts/src"
+
+tiziano_mac_mini:
+  paths:
+    src_path: "/Users/tizianocausin/Desktop/IT_recap/python_scripts/src"
+    livingstone_lab: "/Users/tizianocausin/livingstone_lab_local"
+    data_path: "/Users/tizianocausin/IT_recap_local"
+    metrics_II_data_path: "/Users/tizianocausin/metrics_II_local"
+    it_recap_data_path: "/Users/tizianocausin/IT_recap_local"
+    data_formatted: "/Volumes/LivingstoneLab/Data/Data-Formatted"
+    data_neuropixels: "/Volumes/LivingstoneLab/Data/Data-Neuropixels-Preprocessed"
+    useful_stuff_path: "/Users/tizianocausin/Desktop/useful_stuff/python_scripts/src"
+
+o2_cluster:
+  paths:
+    src_path: "/home/tic569/IT_recap/python_scripts/src"
+    livingstone_lab: "/n/data2/hms/neurobio/livingstone"
+    data_formatted: "/n/data2/hms/neurobio/livingstone/Data/Formatted"
+    data_neuropixels: "/n/data2/hms/neurobio/livingstone/Data/Npx-Preprocessed"
+    useful_stuff_path: "/home/tic569/useful_stuff/python_scripts/src"
+
+dipsen_hpc:
+  paths:
+    src_path: "/home/tiziano.causin/IT_recap/python_scripts/src"
+    data_path: "/mnt/storage/tier2/morwur/Projects/TIZIANO/IT_recap_nas"
+    useful_stuff_path: "/home/tiziano.causin/useful_stuff/python_scripts/src"
+    livingstone_lab: "/mnt/storage/tier2/morwur/Projects/TIZIANO/livingstone_lab"

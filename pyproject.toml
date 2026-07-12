@@ -1,0 +1,29 @@
+[project]
+name = "it-recap"
+version = "0.1.0"
+description = "Literature and modelling utilities for IT cortex representation dynamics."
+readme = "README.md"
+requires-python = "==3.14.*"
+dependencies = [
+    "accelerate>=1.13.0",
+    "einops>=0.8.2",
+    "h5py>=3.15.1",
+    "huggingface-hub<1",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.8",
+    "mpi4py>=4.1.1",
+    "numba>=0.64.0",
+    "numpy>=2.4.2",
+    "opencv-python>=4.13.0.92",
+    "path>=17.1.1",
+    "pillow>=12.0.0",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "timm>=1.0.24",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "transformers<5",
+    "umap-learn>=0.5.12",
+]
