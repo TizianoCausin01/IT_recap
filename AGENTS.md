@@ -82,6 +82,9 @@ class Cfg:
     metric_A: str = "cosine_cnt"
 ```
 
+14. Comment code so every logical operation is easy to understand.
+    Keep comments concise but sufficient for the user to follow the code line by line. Explain intent, non-obvious control flow, tensor or array shapes, transformations, assumptions, and scientific decisions. Do not merely restate obvious Python syntax or add comments that create visual noise.
+
 # IT_recap Agent Harness
 
 ## Purpose

@@ -55,19 +55,22 @@ def function_name(...):
 8. Be modular, not over-engineered.
    Prefer small functions over large tangled blocks, but avoid unnecessary classes, factories, decorators, or framework-like abstractions.
 
-9. Preserve the project structure.
+9. Put reusable functions in the appropriate `src/` module.
+   Whenever possible, do not define helper or abstraction functions directly in analysis or execution scripts. Place them in the project `src/` module that owns the relevant responsibility, then import and use them from the script. Keep a function in a script only when it is genuinely script-specific and unlikely to be reused.
+
+10. Preserve the project structure.
    Use imports, paths, and module placement that fit the current repository. Do not change folder structure unless explicitly asked.
 
-10. Make generated code easy to inspect.
+11. Make generated code easy to inspect.
     Use clear variable names, readable loops, and simple conditionals. Avoid dense one-liners when they hide intent. Add comments for non-obvious logic, assumptions, and scientific/data-shape decisions.
 
-11. Be conservative with dependencies.
+12. Be conservative with dependencies.
     Do not introduce new packages unless necessary. Prefer the standard library and dependencies already used in this project or `useful_stuff`.
 
-12. Surface conflicts with these rules.
+13. Surface conflicts with these rules.
     If a requested implementation conflicts with this file, mention the conflict and choose the most practical solution for the task.
 
-13. Use a config object to specify the parameters of my code.
+14. Use a config object to specify the parameters of my code.
     If some arguments have to be passed, use argparse in the same way.
 
 For example:
