@@ -1,3 +1,4 @@
 [submodule "third_party/convrnns"]
 	path = third_party/convrnns
 	url = https://github.com/neuroailab/convrnns.git
+	ignore = untracked
