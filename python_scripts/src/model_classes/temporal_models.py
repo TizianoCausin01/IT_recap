@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 
@@ -333,5 +335,308 @@ class TemporalNaiveLayerAttention(nn.Module):
         # Attention can be omitted from the return value during routine training.
         returned_attention = attention_weights if return_attention else None
         return pred, latent, returned_attention
+    # EOF
+# EOC
+
+
+class BaselineModel(nn.Module):
+    """
+    Predict time-resolved neural activity from selected frozen ANN layers.
+
+    Each learned temporal query attends over static layer features. All feature
+    transformations operate pointwise in time, and every target time bin owns a
+    separate neural readout head. There is no recurrence or temporal mixing.
+
+    INPUT (forward):
+        - x: torch.Tensor -> images or cached features
+        - use_precomputed_features: bool -> whether x is [batch, layers, embedding]
+
+    OUTPUT:
+        - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
+        - attention_weights: torch.Tensor -> layer weights [batch, time, layers]
+    """
+
+    """
+    __init__
+    Freeze the image encoder and construct the time-local attention decoder.
+
+    INPUT:
+        - encoder: imgANN -> wrapped frozen image encoder
+        - layers: list[str] -> ordered hooked ANN layers
+        - temporal_embedding_dim: int -> learned query width
+        - value_dim: int -> projected layer-value width
+        - n_timepoints: int -> number of neural target bins
+        - temporal_compression_ratio: int -> must be one for time-local prediction
+        - n_neurons: int -> number of neural output channels
+        - mlp_hidden_dim: int -> hidden width of pointwise decoder MLPs
+        - dropout: float -> decoder dropout probability
+        - key_query_dim: int | None -> optional shared key/query width
+
+    OUTPUT:
+        - None
+    """
+    def __init__(
+        self,
+        encoder,
+        layers,
+        temporal_embedding_dim,
+        value_dim,
+        n_timepoints,
+        temporal_compression_ratio,
+        n_neurons,
+        mlp_hidden_dim,
+        dropout=0.0,
+        key_query_dim=None,
+    ):
+        super().__init__()
+
+        self.layer_names = list(layers)
+        self.n_layers = len(self.layer_names)
+        if self.n_layers == 0:
+            raise ValueError("layers must contain at least one ANN layer.")
+        # end if no ANN layers were requested
+        if temporal_compression_ratio != 1:
+            raise ValueError(
+                "temporal_compression_ratio must be 1 while the model "
+                "uses strictly time-local predictions."
+            )
+        # end if temporal compression would couple output bins
+
+        # Freeze the wrapped encoder and register its underlying nn.Module so
+        # model.to(), parameters(), and state_dict() handle it consistently.
+        encoder.model.eval()
+        self.encoder = encoder
+        for parameter in self.encoder.model.parameters():
+            parameter.requires_grad_(False)
+        # end for encoder parameter
+        self.encoder.set_relevant_layers(self.layer_names)
+        self.encoder_dim = self.encoder.get_layer_output_shape(
+            self.layer_names[0]
+        )[1]
+        self.encoder.create_forward_hook()
+        self.encoder_backbone = self.encoder.model
+
+        # One learned query represents every neural time bin: [T, E_te].
+        self.temporal_compression_ratio = temporal_compression_ratio
+        self.n_temporal_embeddings = n_timepoints
+        self.n_timepoints = n_timepoints
+        self.n_neurons = n_neurons
+        self.temporal_embedding_dim = temporal_embedding_dim
+        self.temporal_embeddings = nn.Parameter(
+            torch.randn(n_timepoints, temporal_embedding_dim) * 0.02
+        )
+
+        # Keys and queries share a width for scaled dot-product attention.
+        self.key_dim = (
+            key_query_dim
+            if key_query_dim is not None
+            else temporal_embedding_dim
+        )
+        self.query_dim = self.key_dim
+        self.value_dim = value_dim
+
+        # Project the static ANN layer vectors into attention keys and values.
+        self.key_projection = nn.Linear(
+            self.encoder_dim,
+            self.key_dim,
+            bias=False,
+        )
+        self.value_projection = nn.Linear(
+            self.encoder_dim,
+            self.value_dim,
+            bias=False,
+        )
+        if self.query_dim != self.temporal_embedding_dim:
+            self.query_projection = nn.Linear(
+                self.temporal_embedding_dim,
+                self.query_dim,
+                bias=False,
+            )
+        # end if temporal queries need projection
+        self.key_norm = nn.LayerNorm(self.key_dim)
+        self.value_norm = nn.LayerNorm(self.value_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # These MLPs read only the last tensor dimension and cannot mix time.
+        self.temporal_feature_mlp = nn.Sequential(
+            nn.Linear(value_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, value_dim),
+        )
+        self.neural_feature_mlp = nn.Sequential(
+            nn.Linear(value_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        # Head t receives only latent t and owns its neural prediction weights.
+        self.timebin_readouts = nn.ModuleList(
+            [
+                nn.Linear(mlp_hidden_dim, n_neurons)
+                for _ in range(n_timepoints)
+            ]
+        )
+
+    def train(self, mode=True):
+        # Train the decoder while keeping the frozen backbone deterministic.
+        super().train(mode)
+        self.encoder_backbone.eval()
+        return self
+    # EOF
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+    # EOF
+
+    # --- GETTERS ---
+    def get_encoder(self):
+        return self.encoder
+
+    def get_layer_names(self) -> list[str]:
+        return self.layer_names
+
+    def get_encoder_dim(self) -> int:
+        return self.encoder_dim
+
+    def get_temporal_embedding_dim(self) -> int:
+        return self.temporal_embedding_dim
+
+    def get_n_temporal_embeddings(self) -> int:
+        return self.temporal_embeddings.shape[0]
+
+    def get_temporal_compression_ratio(self) -> int:
+        return self.temporal_compression_ratio
+
+    def get_n_timepoints(self) -> int:
+        return self.n_timepoints
+
+    def get_n_neurons(self) -> int:
+        return self.n_neurons
+
+    def get_key_dim(self) -> int:
+        return self.key_dim
+
+    def get_query_dim(self) -> int:
+        return self.query_dim
+
+    def get_value_dim(self) -> int:
+        return self.value_dim
+
+    def get_trainable_parameters(self):
+        return (
+            parameter
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
+
+    def get_trainable_named_parameters(self):
+        return (
+            (name, parameter)
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+        )
+    # EOF
+
+    """
+    _resolve_layer_features
+    Select cached layer features or extract them online with frozen DINO.
+
+    INPUT:
+        - x: torch.Tensor -> images or cached features
+        - use_precomputed_features: bool -> whether x is [batch, layers, embedding]
+
+    OUTPUT:
+        - layer_features: torch.Tensor -> features [batch, layers, embedding]
+    """
+    def _resolve_layer_features(self, x, use_precomputed_features):
+        if use_precomputed_features:
+            layer_features = x
+        else:
+            # Hooks registered on the frozen encoder collect requested layers.
+            with torch.no_grad():
+                self.encoder.model(x)
+            # end with frozen encoder forward
+            captured_features = self.encoder.features
+            layer_features = torch.stack(
+                [captured_features[layer] for layer in self.layer_names],
+                dim=1,
+            )
+        # end if precomputed layer features are supplied
+
+        expected_shape = (self.n_layers, self.encoder_dim)
+        has_expected_shape = (
+            layer_features.ndim == 3
+            and tuple(layer_features.shape[1:]) == expected_shape
+        )
+        if not has_expected_shape:
+            raise ValueError(
+                "Expected layer features with shape [batch, layers, embedding] "
+                f"and trailing dimensions {expected_shape}, got "
+                f"{tuple(layer_features.shape)}."
+            )
+        # end if layer features have the wrong shape
+
+        # Cached CPU arrays follow the trainable projections' device and dtype.
+        return layer_features.to(
+            device=self.key_projection.weight.device,
+            dtype=self.key_projection.weight.dtype,
+        )
+    # EOF
+
+    """
+    forward
+    Attend over frozen ANN layers and predict every neural time bin locally.
+
+    INPUT:
+        - x: torch.Tensor -> images or cached features
+        - use_precomputed_features: bool -> whether x is [batch, layers, embedding]
+
+    OUTPUT:
+        - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
+        - attention_weights: torch.Tensor -> layer weights [batch, time, layers]
+    """
+    def forward(self, x, use_precomputed_features=False):
+        # Resolve one pooled feature vector per selected ANN layer: [B, L, E].
+        layer_features = self._resolve_layer_features(
+            x,
+            use_precomputed_features,
+        )
+
+        # Build normalized layer keys and values: [B, L, E_k/E_v].
+        keys = self.dropout(self.key_norm(self.key_projection(layer_features)))
+        values = self.dropout(
+            self.value_norm(self.value_projection(layer_features))
+        )
+
+        # Expand the learned time queries across images: [B, T, E_k].
+        if hasattr(self, "query_projection"):
+            queries = self.query_projection(self.temporal_embeddings)
+        else:
+            queries = self.temporal_embeddings
+        # end if temporal queries require projection
+        queries = queries.unsqueeze(0).expand(layer_features.shape[0], -1, -1)
+
+        # Each time query attends only over the ANN layer axis.
+        attention_logits = torch.matmul(queries, keys.transpose(-1, -2))
+        attention_logits = attention_logits / math.sqrt(self.key_dim)
+        attention_weights = torch.softmax(attention_logits, dim=-1)
+
+        # Weighted layer values produce one independent latent per time bin.
+        coarse_latents = torch.matmul(attention_weights, values)
+        fine_latents = self.temporal_feature_mlp(coarse_latents)
+        neural_features = self.neural_feature_mlp(fine_latents)
+
+        # Apply readout t only to neural feature t; never mix temporal bins.
+        timebin_predictions = []
+        for timebin, timebin_readout in enumerate(self.timebin_readouts):
+            current_prediction = timebin_readout(
+                neural_features[:, timebin, :]
+            )
+            timebin_predictions.append(current_prediction)
+        # end for time-bin-specific readout
+        neural_predictions = torch.stack(timebin_predictions, dim=1)
+        return neural_predictions, attention_weights
     # EOF
 # EOC
