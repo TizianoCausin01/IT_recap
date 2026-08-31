@@ -105,6 +105,104 @@ def feature_save_path(
 
 
 """
+load_hf_layer_features
+Load saved pooled features for several layers and align them to a requested
+stimulus order.
+
+INPUT:
+    - output_dir: Path -> directory containing the per-layer NPZ files
+    - dataset_name: str -> stimulus dataset name used in saved filenames
+    - model_name: str -> saved model alias
+    - img_size: int -> processor output resolution used during extraction
+    - layer_names: list[str] -> ordered layers to load
+    - pooling: str -> feature pooling method used during extraction
+    - image_indices: np.ndarray | list[int] | None -> optional stimulus reordering
+
+OUTPUT:
+    - layer_features: np.ndarray -> features [images, layers, embedding]
+"""
+def load_hf_layer_features(
+    output_dir: Path,
+    dataset_name: str,
+    model_name: str,
+    img_size: int,
+    layer_names: list[str],
+    pooling: str,
+    image_indices: np.ndarray | list[int] | None = None,
+) -> np.ndarray:
+    output_dir = Path(output_dir)
+    if not layer_names:
+        raise ValueError("layer_names must contain at least one layer.")
+    # end if no layers were requested
+
+    ordered_indices = None
+    if image_indices is not None:
+        ordered_indices = np.asarray(image_indices, dtype=int)
+        if ordered_indices.ndim != 1 or ordered_indices.size == 0:
+            raise ValueError("image_indices must be a non-empty one-dimensional array.")
+        # end if image indices have the wrong shape
+    # end if image indices were supplied
+
+    loaded_layers = []
+    expected_shape = None
+    for layer_name in layer_names:
+        save_path = feature_save_path(
+            output_dir,
+            dataset_name,
+            model_name,
+            img_size,
+            layer_name,
+            pooling,
+        )
+        if not save_path.is_file():
+            raise FileNotFoundError(f"Saved features were not found at {save_path}.")
+        # end if the layer feature file is missing
+
+        with np.load(save_path) as saved_data:
+            if "arr_0" not in saved_data:
+                raise KeyError(f"{save_path} does not contain the expected arr_0 key.")
+            # end if the default NumPy archive key is missing
+            layer_features = saved_data["arr_0"]
+        # end with saved feature file
+
+        # Extraction stores each layer as [embedding, images].
+        if layer_features.ndim != 2:
+            raise ValueError(
+                f"Expected [embedding, images] at {save_path}, got "
+                f"{layer_features.shape}."
+            )
+        # end if saved features do not have two axes
+        if ordered_indices is not None:
+            indices_are_invalid = (
+                ordered_indices.min() < 0
+                or ordered_indices.max() >= layer_features.shape[1]
+            )
+            if indices_are_invalid:
+                raise IndexError(
+                    f"image_indices exceed the {layer_features.shape[1]} saved images."
+                )
+            # end if an image index is out of bounds
+            layer_features = layer_features[:, ordered_indices]
+        # end if features must be reordered
+
+        layer_features = layer_features.T.astype(np.float32, copy=False)
+        if expected_shape is None:
+            expected_shape = layer_features.shape
+        elif layer_features.shape != expected_shape:
+            raise ValueError(
+                f"Layer {layer_name!r} has shape {layer_features.shape}; expected "
+                f"{expected_shape}."
+            )
+        # end if layer shapes do not match
+        loaded_layers.append(layer_features)
+    # end for layer_name
+
+    # Preserve layer_names order on the second axis.
+    return np.stack(loaded_layers, axis=1)
+# EOF
+
+
+"""
 split_layers
 Split model layers into at most one extraction group per MPI worker.
 
