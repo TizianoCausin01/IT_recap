@@ -4,6 +4,42 @@ import torch
 
 
 """
+aggregate_attention_by_layer
+Convert whole-layer or feature-level attention into comparable layer weights.
+
+Feature-level weights are averaged over embedding coordinates and then
+renormalized over layers. This is equivalent to each layer's total attention
+mass, while retaining the interpretation of an average feature weight.
+
+INPUT:
+    - attention_weights: torch.Tensor -> [batch, time, layers] or
+      [batch, time, layers, embedding]
+
+OUTPUT:
+    - layer_attention: torch.Tensor -> normalized [batch, time, layers] weights
+"""
+def aggregate_attention_by_layer(attention_weights):
+    if attention_weights.ndim == 3:
+        return attention_weights
+    # end if attention already operates over whole layers
+    if attention_weights.ndim != 4:
+        raise ValueError(
+            "attention_weights must have shape [batch, time, layers] or "
+            "[batch, time, layers, embedding]."
+        )
+    # end if attention weights have an unsupported shape
+
+    # Average the feature weights within each layer, then normalize the layer
+    # axis so the displayed values sum to one at every image and time bin.
+    mean_feature_attention = attention_weights.mean(dim=-1)
+    normalization = mean_feature_attention.sum(dim=-1, keepdim=True)
+    return mean_feature_attention / normalization.clamp_min(
+        torch.finfo(mean_feature_attention.dtype).eps
+    )
+# EOF
+
+
+"""
 neural_activity_timebin_mse_loss
 Compute aligned MSE independently at each time bin, then average bins.
 

@@ -343,9 +343,10 @@ class BaselineModel(nn.Module):
     """
     Predict time-resolved neural activity from selected frozen ANN layers.
 
-    Each learned temporal query attends over static layer features. All feature
-    transformations operate pointwise in time, and every target time bin owns a
-    separate neural readout head. There is no recurrence or temporal mixing.
+    Each learned temporal query attends either over whole ANN layers or over the
+    individual embedding coordinates within those layers. All transformations
+    operate pointwise in time, and every target time bin owns a separate neural
+    readout head. There is no recurrence or temporal mixing.
 
     INPUT (forward):
         - x: torch.Tensor -> images or cached features
@@ -353,7 +354,8 @@ class BaselineModel(nn.Module):
 
     OUTPUT:
         - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
-        - attention_weights: torch.Tensor -> layer weights [batch, time, layers]
+        - attention_weights: torch.Tensor -> layer weights [B, T, L] or feature
+          weights [B, T, L, E], depending on attention_granularity
     """
 
     """
@@ -371,6 +373,7 @@ class BaselineModel(nn.Module):
         - mlp_hidden_dim: int -> hidden width of pointwise decoder MLPs
         - dropout: float -> decoder dropout probability
         - key_query_dim: int | None -> optional shared key/query width
+        - attention_granularity: str -> "layer" or "feature"
 
     OUTPUT:
         - None
@@ -387,6 +390,7 @@ class BaselineModel(nn.Module):
         mlp_hidden_dim,
         dropout=0.0,
         key_query_dim=None,
+        attention_granularity="layer",
     ):
         super().__init__()
 
@@ -401,6 +405,11 @@ class BaselineModel(nn.Module):
                 "uses strictly time-local predictions."
             )
         # end if temporal compression would couple output bins
+        if attention_granularity not in {"layer", "feature"}:
+            raise ValueError(
+                "attention_granularity must be either 'layer' or 'feature'."
+            )
+        # end if attention granularity is invalid
 
         # Freeze the wrapped encoder and register its underlying nn.Module so
         # model.to(), parameters(), and state_dict() handle it consistently.
@@ -415,6 +424,7 @@ class BaselineModel(nn.Module):
         )[1]
         self.encoder.create_forward_hook()
         self.encoder_backbone = self.encoder.model
+        self.attention_granularity = attention_granularity
 
         # One learned query represents every neural time bin: [T, E_te].
         self.temporal_compression_ratio = temporal_compression_ratio
@@ -435,17 +445,45 @@ class BaselineModel(nn.Module):
         self.query_dim = self.key_dim
         self.value_dim = value_dim
 
-        # Project the static ANN layer vectors into attention keys and values.
-        self.key_projection = nn.Linear(
-            self.encoder_dim,
-            self.key_dim,
-            bias=False,
-        )
-        self.value_projection = nn.Linear(
-            self.encoder_dim,
-            self.value_dim,
-            bias=False,
-        )
+        # Whole-layer mode preserves the original L-item cross-attention. In
+        # feature mode, every one of the L * E embedding coordinates receives a
+        # learned key direction and is gated separately at every time bin.
+        if self.attention_granularity == "layer":
+            self.key_projection = nn.Linear(
+                self.encoder_dim,
+                self.key_dim,
+                bias=False,
+            )
+            self.value_projection = nn.Linear(
+                self.encoder_dim,
+                self.value_dim,
+                bias=False,
+            )
+            self.key_norm = nn.LayerNorm(self.key_dim)
+        else:
+            self.n_attention_features = self.n_layers * self.encoder_dim
+            self.feature_input_norm = nn.LayerNorm(
+                self.encoder_dim,
+                elementwise_affine=False,
+            )
+            self.feature_key_embeddings = nn.Parameter(
+                torch.empty(
+                    self.n_layers,
+                    self.encoder_dim,
+                    self.key_dim,
+                )
+            )
+            nn.init.normal_(
+                self.feature_key_embeddings,
+                mean=0.0,
+                std=0.02,
+            )
+            self.feature_value_projection = nn.Linear(
+                self.n_attention_features,
+                self.value_dim,
+                bias=False,
+            )
+        # end if attention operates over layers or embedding features
         if self.query_dim != self.temporal_embedding_dim:
             self.query_projection = nn.Linear(
                 self.temporal_embedding_dim,
@@ -453,7 +491,6 @@ class BaselineModel(nn.Module):
                 bias=False,
             )
         # end if temporal queries need projection
-        self.key_norm = nn.LayerNorm(self.key_dim)
         self.value_norm = nn.LayerNorm(self.value_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -524,6 +561,9 @@ class BaselineModel(nn.Module):
     def get_value_dim(self) -> int:
         return self.value_dim
 
+    def get_attention_granularity(self) -> str:
+        return self.attention_granularity
+
     def get_trainable_parameters(self):
         return (
             parameter
@@ -580,9 +620,84 @@ class BaselineModel(nn.Module):
 
         # Cached CPU arrays follow the trainable projections' device and dtype.
         return layer_features.to(
-            device=self.key_projection.weight.device,
-            dtype=self.key_projection.weight.dtype,
+            device=self.temporal_embeddings.device,
+            dtype=self.temporal_embeddings.dtype,
         )
+    # EOF
+
+    """
+    _compute_layer_attention
+    Attend over one projected key/value vector per selected ANN layer.
+
+    INPUT:
+        - layer_features: torch.Tensor -> features [batch, layers, embedding]
+        - queries: torch.Tensor -> temporal queries [batch, time, key_dim]
+
+    OUTPUT:
+        - coarse_latents: torch.Tensor -> attended values [batch, time, value_dim]
+        - attention_weights: torch.Tensor -> layer weights [batch, time, layers]
+    """
+    def _compute_layer_attention(self, layer_features, queries):
+        keys = self.dropout(
+            self.key_norm(self.key_projection(layer_features))
+        )
+        values = self.dropout(
+            self.value_norm(self.value_projection(layer_features))
+        )
+        attention_logits = torch.matmul(queries, keys.transpose(-1, -2))
+        attention_logits = attention_logits / math.sqrt(self.key_dim)
+        attention_weights = torch.softmax(attention_logits, dim=-1)
+        coarse_latents = torch.matmul(attention_weights, values)
+        return coarse_latents, attention_weights
+    # EOF
+
+    """
+    _compute_feature_attention
+    Attend over every embedding coordinate within every selected ANN layer.
+
+    INPUT:
+        - layer_features: torch.Tensor -> features [batch, layers, embedding]
+        - queries: torch.Tensor -> temporal queries [batch, time, key_dim]
+
+    OUTPUT:
+        - coarse_latents: torch.Tensor -> attended values [batch, time, value_dim]
+        - attention_weights: torch.Tensor -> feature weights
+          [batch, time, layers, embedding]
+    """
+    def _compute_feature_attention(self, layer_features, queries):
+        # Normalize each layer vector without learning a second feature gate.
+        normalized_features = self.feature_input_norm(layer_features)
+
+        # Contract queries with the learned coordinate keys before applying the
+        # stimulus activation. This avoids materializing [B, L, E, E_k].
+        feature_key_embeddings = self.dropout(self.feature_key_embeddings)
+        attention_logits = torch.einsum(
+            "btk,lek->btle",
+            queries,
+            feature_key_embeddings,
+        )
+        attention_logits = (
+            attention_logits * normalized_features.unsqueeze(1)
+        )
+
+        # Each temporal query scores all L * E individual feature coordinates.
+        attention_logits = attention_logits / math.sqrt(self.key_dim)
+        flat_logits = attention_logits.flatten(start_dim=-2)
+        attention_weights = torch.softmax(flat_logits, dim=-1).reshape_as(
+            attention_logits
+        )
+
+        # Uniform attention should initially preserve the normalized feature
+        # scale. Multiplication by L * E makes a uniform gate equal to one.
+        gated_features = (
+            normalized_features.unsqueeze(1)
+            * attention_weights
+            * self.n_attention_features
+        )
+        flat_gated_features = gated_features.flatten(start_dim=-2)
+        coarse_latents = self.feature_value_projection(flat_gated_features)
+        coarse_latents = self.dropout(self.value_norm(coarse_latents))
+        return coarse_latents, attention_weights
     # EOF
 
     """
@@ -595,19 +710,14 @@ class BaselineModel(nn.Module):
 
     OUTPUT:
         - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
-        - attention_weights: torch.Tensor -> layer weights [batch, time, layers]
+        - attention_weights: torch.Tensor -> layer weights [B, T, L] or feature
+          weights [B, T, L, E], depending on attention_granularity
     """
     def forward(self, x, use_precomputed_features=False):
         # Resolve one pooled feature vector per selected ANN layer: [B, L, E].
         layer_features = self._resolve_layer_features(
             x,
             use_precomputed_features,
-        )
-
-        # Build normalized layer keys and values: [B, L, E_k/E_v].
-        keys = self.dropout(self.key_norm(self.key_projection(layer_features)))
-        values = self.dropout(
-            self.value_norm(self.value_projection(layer_features))
         )
 
         # Expand the learned time queries across images: [B, T, E_k].
@@ -618,13 +728,20 @@ class BaselineModel(nn.Module):
         # end if temporal queries require projection
         queries = queries.unsqueeze(0).expand(layer_features.shape[0], -1, -1)
 
-        # Each time query attends only over the ANN layer axis.
-        attention_logits = torch.matmul(queries, keys.transpose(-1, -2))
-        attention_logits = attention_logits / math.sqrt(self.key_dim)
-        attention_weights = torch.softmax(attention_logits, dim=-1)
+        # Select the requested attention axis without changing temporal flow.
+        if self.attention_granularity == "layer":
+            coarse_latents, attention_weights = self._compute_layer_attention(
+                layer_features,
+                queries,
+            )
+        else:
+            coarse_latents, attention_weights = self._compute_feature_attention(
+                layer_features,
+                queries,
+            )
+        # end if attention operates over layers or embedding features
 
-        # Weighted layer values produce one independent latent per time bin.
-        coarse_latents = torch.matmul(attention_weights, values)
+        # Refine one independent attended latent per target time bin.
         fine_latents = self.temporal_feature_mlp(coarse_latents)
         neural_features = self.neural_feature_mlp(fine_latents)
 
