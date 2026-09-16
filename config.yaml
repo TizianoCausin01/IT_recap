@@ -9,6 +9,7 @@ tiziano_local:
 tiziano_mac_mini:
   paths:
     src_path: "/Users/tizianocausin/Desktop/IT_recap/python_scripts/src"
+    things_images: "/Users/tizianocausin/datasets/THINGS/object_images"
     livingstone_lab: "/Users/tizianocausin/livingstone_lab_local"
     data_path: "/Users/tizianocausin/IT_recap_local"
     metrics_II_data_path: "/Users/tizianocausin/metrics_II_local"
