@@ -553,6 +553,125 @@ class TVSDTrialDataset(Dataset):
 
 
 """
+extract_tvsd_spatial_features
+Cache the complete spatial feature map of one convolutional layer for the
+ordered TVSD stimuli, streaming straight into a float16 memory map.
+
+The pooled archives written by extract_tvsd_ann_features collapse every spatial
+position into one vector per layer. A conv5 map is 256 x 13 x 13 per image, so
+the ordered train split alone is 1.9 GB: it is written incrementally and read
+back memory-mapped rather than held in RAM.
+
+INPUT:
+    - model: nn.Module -> frozen backbone in eval mode, already on the device
+    - layer_name: str -> hooked module name, e.g. "features.11" for AlexNet conv5
+    - image_datasets: dict -> split name to ordered Dataset of transformed images
+    - output_dir: Path | str -> destination directory for the caches
+    - output_stem: str -> file stem; each split becomes "<stem>_<split>.npy"
+    - device: torch.device -> compute device
+    - batch_size: int -> images per forward pass
+    - num_workers: int -> image-loading worker count
+    - progress_interval: int -> report every N batches; zero disables reports
+    - overwrite: bool -> whether existing caches may be replaced
+
+OUTPUT:
+    - cache_paths: dict -> split name to the written .npy path
+    - feature_shape: tuple[int, int, int] -> cached [channels, height, width]
+"""
+def extract_tvsd_spatial_features(
+    model,
+    layer_name,
+    image_datasets,
+    output_dir,
+    output_stem,
+    device,
+    batch_size=64,
+    num_workers=0,
+    progress_interval=25,
+    overwrite=False,
+):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_paths = {
+        split_name: output_dir / f"{output_stem}_{split_name}.npy"
+        for split_name in image_datasets
+    }
+    modules = dict(model.named_modules())
+    if layer_name not in modules:
+        raise KeyError(f"{layer_name!r} is not a module of this backbone.")
+    # end if the requested layer does not exist
+
+    captured = {}
+    hook_handle = modules[layer_name].register_forward_hook(
+        lambda module, inputs, output: captured.__setitem__("features", output)
+    )
+    feature_shape = None
+    try:
+        for split_name, image_dataset in image_datasets.items():
+            cache_path = cache_paths[split_name]
+            if cache_path.is_file() and not overwrite:
+                cached = np.load(cache_path, mmap_mode="r")
+                feature_shape = tuple(cached.shape[1:])
+                print(f"{split_name}: reusing {cache_path.name} {cached.shape}")
+                continue
+            # end if this split is already cached
+
+            loader = DataLoader(
+                image_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=torch.device(device).type == "cuda",
+            )
+            cache = None
+            written = 0
+            with torch.inference_mode():
+                for batch_idx, pixel_values in enumerate(loader, start=1):
+                    model(pixel_values.to(device))
+                    features = captured["features"]
+                    if features.ndim != 4:
+                        raise ValueError(
+                            f"{layer_name!r} returned {tuple(features.shape)}; "
+                            "a spatial cache needs [batch, channels, h, w]."
+                        )
+                    # end if the hooked layer is not convolutional
+                    if cache is None:
+                        feature_shape = tuple(features.shape[1:])
+                        # float16 halves a cache that reaches several GB; the
+                        # values are activations, not accumulated statistics.
+                        cache = np.lib.format.open_memmap(
+                            cache_path,
+                            mode="w+",
+                            dtype=np.float16,
+                            shape=(len(image_dataset), *feature_shape),
+                        )
+                    # end if the destination is not open yet
+                    batch_features = features.detach().cpu().numpy()
+                    cache[written:written + len(batch_features)] = batch_features
+                    written += len(batch_features)
+                    should_report = progress_interval > 0 and (
+                        batch_idx % progress_interval == 0
+                        or batch_idx == len(loader)
+                    )
+                    if should_report:
+                        print(
+                            f"{split_name}: {written:,}/{len(image_dataset):,} "
+                            f"images -> {feature_shape}"
+                        )
+                    # end if this batch should be reported
+                # end for image batch
+            # end with frozen feature extraction
+            cache.flush()
+            del cache
+        # end for stimulus split
+    finally:
+        hook_handle.remove()
+    # end try hooked extraction
+    return cache_paths, feature_shape
+# EOF
+
+
+"""
 extract_tvsd_ann_features
 Extract selected pooled ANN-layer features once for the ordered train and test
 stimuli, then save the arrays needed for efficient BaselineModel training.

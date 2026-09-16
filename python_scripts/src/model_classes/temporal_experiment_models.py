@@ -7,7 +7,14 @@ from torch import nn
 class CachedFeatureTemporalModel(nn.Module):
     """Shared validation and normalization for cached layer-feature decoders."""
 
-    def __init__(self, n_layers, feature_dim, n_timepoints, n_neurons):
+    def __init__(
+        self,
+        n_layers,
+        feature_dim,
+        n_timepoints,
+        n_neurons,
+        normalize_features=True,
+    ):
         super().__init__()
         dimensions = (n_layers, feature_dim, n_timepoints, n_neurons)
         if min(dimensions) <= 0:
@@ -18,7 +25,17 @@ class CachedFeatureTemporalModel(nn.Module):
         self.feature_dim = feature_dim
         self.n_timepoints = n_timepoints
         self.n_neurons = n_neurons
-        self.feature_norm = nn.LayerNorm(feature_dim, elementwise_affine=False)
+        # ANN activations differ in scale by depth and by encoder, so they are
+        # normalized per (image, group) by default. An input that is already in
+        # the target's units -- a level-one ridge map, say -- must not be, since
+        # that normalization would divide out the very response magnitude the
+        # level-one model predicted.
+        self.normalize_features = bool(normalize_features)
+        self.feature_norm = (
+            nn.LayerNorm(feature_dim, elementwise_affine=False)
+            if self.normalize_features
+            else nn.Identity()
+        )
 
     def _validate_features(self, layer_features):
         expected_shape = (self.n_layers, self.feature_dim)
