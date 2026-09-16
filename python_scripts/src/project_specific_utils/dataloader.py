@@ -1,5 +1,6 @@
 import os, sys, yaml
 import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
 import h5py
 import re
@@ -13,6 +14,172 @@ paths = config[ENV]["paths"]
 sys.path.append(paths["src_path"])
 sys.path.append(paths["useful_stuff_path"])
 from useful_stuff.general_utils.utils import TimeSeries
+
+
+@dataclass(frozen=True)
+class NeuralPreprocessingStats:
+    """Statistics fitted once and reused to preprocess neural responses."""
+
+    feature_mean: np.ndarray
+    neuron_lower: np.ndarray
+    neuron_scale: np.ndarray
+    center_features: bool
+    robust_minmax_neurons: bool
+    clip_robust_minmax: bool
+# EOC
+
+
+"""
+fit_neural_preprocessing
+Fit optional feature-wise centering and robust per-neuron min-max statistics.
+
+Feature-wise centering treats every (neuron, time-bin) pair as one feature and
+estimates its mean across the selected samples. Robust min-max normalization
+then estimates one lower and upper percentile per neuron, pooling its centered
+values across time and selected samples.
+
+INPUT:
+    - neural_activity: np.ndarray -> responses [neurons, time, samples]
+    - fitting_sample_indices: array-like | None -> samples used to fit statistics
+    - center_features: bool -> subtract each neuron-time feature mean
+    - robust_minmax_neurons: bool -> scale each neuron by robust percentiles
+    - robust_percentile_range: tuple[float, float] -> lower and upper percentiles
+    - clip_robust_minmax: bool -> clip robust-scaled values to [0, 1]
+    - minimum_scale: float -> lower bound for a non-degenerate neuron range
+
+OUTPUT:
+    - stats: NeuralPreprocessingStats -> fitted broadcastable statistics
+"""
+def fit_neural_preprocessing(
+    neural_activity,
+    fitting_sample_indices=None,
+    center_features=False,
+    robust_minmax_neurons=False,
+    robust_percentile_range=(1.0, 99.0),
+    clip_robust_minmax=True,
+    minimum_scale=1e-6,
+):
+    neural_activity = np.asarray(neural_activity)
+    if neural_activity.ndim != 3:
+        raise ValueError(
+            "neural_activity must have shape [neurons, time, samples]."
+        )
+    # end if neural axes are invalid
+    if not np.isfinite(neural_activity).all():
+        raise ValueError("neural_activity contains non-finite values.")
+    # end if neural values cannot define finite statistics
+
+    if fitting_sample_indices is None:
+        fitting_sample_indices = np.arange(neural_activity.shape[2])
+    else:
+        fitting_sample_indices = np.asarray(fitting_sample_indices, dtype=int)
+    # end if all samples define the preprocessing statistics
+    if fitting_sample_indices.ndim != 1 or fitting_sample_indices.size == 0:
+        raise ValueError("fitting_sample_indices must be a non-empty vector.")
+    # end if no fitting samples were supplied
+    if (
+        fitting_sample_indices.min() < 0
+        or fitting_sample_indices.max() >= neural_activity.shape[2]
+    ):
+        raise IndexError("fitting_sample_indices exceed neural_activity.")
+    # end if a fitting sample is out of range
+
+    lower_percentile, upper_percentile = robust_percentile_range
+    percentile_range_is_invalid = not (
+        0.0 <= lower_percentile < upper_percentile <= 100.0
+    )
+    if percentile_range_is_invalid:
+        raise ValueError(
+            "robust_percentile_range must satisfy "
+            "0 <= lower < upper <= 100."
+        )
+    # end if robust percentiles are invalid
+    if minimum_scale <= 0:
+        raise ValueError("minimum_scale must be positive.")
+    # end if the scale floor is invalid
+
+    fitting_activity = neural_activity[:, :, fitting_sample_indices].astype(
+        np.float32,
+        copy=False,
+    )
+    if center_features:
+        feature_mean = fitting_activity.mean(axis=2, keepdims=True)
+    else:
+        feature_mean = np.zeros(
+            (*neural_activity.shape[:2], 1),
+            dtype=np.float32,
+        )
+    # end if feature-wise centering is requested
+
+    centered_fitting_activity = fitting_activity - feature_mean
+    if robust_minmax_neurons:
+        neuron_lower, neuron_upper = np.percentile(
+            centered_fitting_activity,
+            [lower_percentile, upper_percentile],
+            axis=(1, 2),
+            keepdims=True,
+        )
+        neuron_scale = np.maximum(
+            neuron_upper - neuron_lower,
+            minimum_scale,
+        )
+    else:
+        neuron_lower = np.zeros(
+            (neural_activity.shape[0], 1, 1),
+            dtype=np.float32,
+        )
+        neuron_scale = np.ones_like(neuron_lower)
+    # end if robust per-neuron scaling is requested
+
+    return NeuralPreprocessingStats(
+        feature_mean=feature_mean.astype(np.float32),
+        neuron_lower=neuron_lower.astype(np.float32),
+        neuron_scale=neuron_scale.astype(np.float32),
+        center_features=bool(center_features),
+        robust_minmax_neurons=bool(robust_minmax_neurons),
+        clip_robust_minmax=bool(clip_robust_minmax),
+    )
+# EOF
+
+
+"""
+apply_neural_preprocessing
+Apply fitted neural preprocessing without changing the input array.
+
+INPUT:
+    - neural_activity: np.ndarray -> responses [neurons, time, samples]
+    - stats: NeuralPreprocessingStats -> fitted broadcastable statistics
+
+OUTPUT:
+    - processed_activity: np.ndarray -> float32 responses with unchanged axes
+"""
+def apply_neural_preprocessing(neural_activity, stats):
+    neural_activity = np.asarray(neural_activity)
+    if neural_activity.ndim != 3:
+        raise ValueError(
+            "neural_activity must have shape [neurons, time, samples]."
+        )
+    # end if neural axes are invalid
+    if neural_activity.shape[:2] != stats.feature_mean.shape[:2]:
+        raise ValueError(
+            "neural_activity and preprocessing statistics disagree in their "
+            "[neurons, time] shape."
+        )
+    # end if preprocessing statistics cannot broadcast
+
+    processed_activity = neural_activity.astype(np.float32, copy=True)
+    if stats.center_features:
+        processed_activity -= stats.feature_mean
+    # end if feature-wise centering was fitted
+    if stats.robust_minmax_neurons:
+        processed_activity -= stats.neuron_lower
+        processed_activity /= stats.neuron_scale
+        if stats.clip_robust_minmax:
+            np.clip(processed_activity, 0.0, 1.0, out=processed_activity)
+        # end if percentile outliers should be clipped
+    # end if robust neuron scaling was fitted
+    return processed_activity
+# EOF
 
 """
 decode_matlab_strings

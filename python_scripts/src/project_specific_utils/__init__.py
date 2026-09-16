@@ -1,7 +1,10 @@
 __all__ = [
     "BrainAreas",
+    "NeuralPreprocessingStats",
     "NeuralInputDataset",
+    "apply_neural_preprocessing",
     "decode_matlab_strings",
+    "fit_neural_preprocessing",
     "load_img_raster",
     "load_img_natraster",
     "make_neural_input_loader",
@@ -11,8 +14,11 @@ __all__ = [
 
 from .dataloader import (  # noqa: E402
     BrainAreas,
+    NeuralPreprocessingStats,
     NeuralInputDataset,
+    apply_neural_preprocessing,
     decode_matlab_strings,
+    fit_neural_preprocessing,
     load_img_raster,
     load_img_natraster,
     make_neural_input_loader,
