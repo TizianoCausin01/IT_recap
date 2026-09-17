@@ -837,6 +837,42 @@ class BaselineModel(nn.Module):
 GAUSSIAN_NOISE_LAYER_NAME = "__gaussian_sphere_noise__"
 
 
+"""
+sample_sphere_noise_layer
+Draw one uniform sphere vector per image to serve as a noise pseudo-layer.
+
+INPUT:
+    - layer_features: torch.Tensor -> real features [batch, layers, embedding]
+    - match_noise_norm: bool -> rescale the unit draw to the mean norm of that
+      image's real layer vectors, so it competes on equal footing
+
+OUTPUT:
+    - noise_layer: torch.Tensor -> noise pseudo-layer [batch, 1, embedding]
+"""
+def sample_sphere_noise_layer(layer_features, match_noise_norm=True):
+    # Normalizing an isotropic Gaussian draw gives a point distributed
+    # uniformly on the embedding-dimensional unit sphere.
+    noise = torch.randn(
+        layer_features.shape[0],
+        1,
+        layer_features.shape[-1],
+        device=layer_features.device,
+        dtype=layer_features.dtype,
+    )
+    noise = noise / noise.norm(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(noise.dtype).eps
+    )
+
+    if match_noise_norm:
+        # Without rescaling, a unit vector is negligible next to real layer
+        # activations and attention would simply ignore it.
+        reference_norm = layer_features.norm(dim=-1).mean(dim=1, keepdim=True)
+        noise = noise * reference_norm.unsqueeze(-1)
+    # end if the noise layer is scale-matched to the real layers
+    return noise
+# EOF
+
+
 class NoiseLayerBaselineModel(BaselineModel):
     """
     BaselineModel that attends over the hooked ANN layers plus one noise layer.
@@ -918,27 +954,7 @@ class NoiseLayerBaselineModel(BaselineModel):
         - noise_layer: torch.Tensor -> noise pseudo-layer [batch, 1, embedding]
     """
     def _sample_noise_layer(self, layer_features):
-        # Normalizing an isotropic Gaussian draw gives a point distributed
-        # uniformly on the encoder_dim-dimensional unit sphere.
-        noise = torch.randn(
-            layer_features.shape[0],
-            1,
-            self.encoder_dim,
-            device=layer_features.device,
-            dtype=layer_features.dtype,
-        )
-        noise = noise / noise.norm(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(noise.dtype).eps
-        )
-
-        if self.match_noise_norm:
-            # Without rescaling, a unit vector is negligible next to DINO layer
-            # activations and attention would simply ignore it. Matching the
-            # mean real-layer norm makes it a genuine competitor.
-            reference_norm = layer_features.norm(dim=-1).mean(dim=1, keepdim=True)
-            noise = noise * reference_norm.unsqueeze(-1)
-        # end if the noise layer is scale-matched to the real layers
-        return noise
+        return sample_sphere_noise_layer(layer_features, self.match_noise_norm)
     # EOF
 
     """
@@ -1108,16 +1124,18 @@ class ShowAttendTellGRUModel(nn.Module):
 
     """
     __init__
-    Freeze the image encoder and construct one feature-attention GRU layer.
+    Construct one feature-attention GRU with an optional frozen image encoder.
 
     INPUT:
-        - encoder: imgANN -> wrapped frozen image encoder
+        - encoder: imgANN | None -> frozen encoder, or None for cached features
         - layers: list[str] -> ordered hooked ANN layers
         - n_timepoints: int -> number of recurrent neural target bins
         - n_neurons: int -> number of neural output channels
         - hidden_dim: int -> GRU state and attended-context width
         - attention_dim: int -> feature-key and hidden-query width
         - dropout: float -> dropout probability before the shared readout
+        - encoder_dim: int | None -> cached feature width when encoder is None;
+          if both are supplied, validates the cache width against the encoder
 
     OUTPUT:
         - None
@@ -1131,6 +1149,7 @@ class ShowAttendTellGRUModel(nn.Module):
         hidden_dim,
         attention_dim,
         dropout=0.0,
+        encoder_dim=None,
     ):
         super().__init__()
 
@@ -1159,18 +1178,39 @@ class ShowAttendTellGRUModel(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.attention_dim = int(attention_dim)
 
-        # Freeze the wrapped backbone and register hooks in the requested order.
-        encoder.model.eval()
+        # Cached-feature training needs only the stored embedding width. Image
+        # mode additionally freezes the backbone and registers layer hooks.
         self.encoder = encoder
-        for parameter in self.encoder.model.parameters():
-            parameter.requires_grad_(False)
-        # end for encoder parameter
-        self.encoder.set_relevant_layers(self.layer_names)
-        self.encoder_dim = self.encoder.get_layer_output_shape(
-            self.layer_names[0]
-        )[1]
-        self.encoder.create_forward_hook()
-        self.encoder_backbone = self.encoder.model
+        self.encoder_backbone = None
+        if self.encoder is None:
+            if encoder_dim is None or int(encoder_dim) <= 0:
+                raise ValueError(
+                    "encoder_dim must be positive when encoder is None."
+                )
+            # end if cached features do not define their embedding width
+            self.encoder_dim = int(encoder_dim)
+        else:
+            self.encoder.model.eval()
+            for parameter in self.encoder.model.parameters():
+                parameter.requires_grad_(False)
+            # end for encoder parameter
+            self.encoder.set_relevant_layers(self.layer_names)
+            inferred_encoder_dim = self.encoder.get_layer_output_shape(
+                self.layer_names[0]
+            )[1]
+            if (
+                encoder_dim is not None
+                and int(encoder_dim) != inferred_encoder_dim
+            ):
+                raise ValueError(
+                    f"encoder_dim {encoder_dim} does not match the backbone "
+                    f"output width {inferred_encoder_dim}."
+                )
+            # end if a supplied cache width disagrees with the backbone
+            self.encoder_dim = inferred_encoder_dim
+            self.encoder.create_forward_hook()
+            self.encoder_backbone = self.encoder.model
+        # end if the model uses cached features or online image encoding
 
         # Normalize each pooled layer vector without adding a learned gate.
         self.feature_input_norm = nn.LayerNorm(
@@ -1218,7 +1258,9 @@ class ShowAttendTellGRUModel(nn.Module):
     def train(self, mode=True):
         # Train the recurrent decoder while keeping the frozen ANN deterministic.
         super().train(mode)
-        self.encoder_backbone.eval()
+        if self.encoder_backbone is not None:
+            self.encoder_backbone.eval()
+        # end if an online image backbone is attached
         return self
     # EOF
 
@@ -1283,6 +1325,12 @@ class ShowAttendTellGRUModel(nn.Module):
         if use_precomputed_features:
             layer_features = x
         else:
+            if self.encoder is None:
+                raise ValueError(
+                    "Online image inputs require an encoder; this model was "
+                    "constructed for cached features only."
+                )
+            # end if images were passed to a cached-feature-only decoder
             # Forward hooks collect the requested pooled layer representations.
             with torch.no_grad():
                 self.encoder.model(x)
@@ -1312,20 +1360,38 @@ class ShowAttendTellGRUModel(nn.Module):
     # EOF
 
     """
+    _build_attention_query
+    Project the previous recurrent state into the attention query space.
+
+    INPUT:
+        - hidden_state: torch.Tensor -> previous GRU state [batch, hidden_dim]
+        - time_index: int -> predicted bin; unused here, for subclasses
+
+    OUTPUT:
+        - query: torch.Tensor -> [batch, attention_dim]
+    """
+    def _build_attention_query(self, hidden_state, time_index):
+        # The recurrent state is the only time-varying attention query.
+        return self.hidden_query_projection(hidden_state)
+    # EOF
+
+    """
     _compute_feature_attention
     Score individual ANN coordinates from the previous recurrent hidden state.
 
     INPUT:
         - normalized_features: torch.Tensor -> [batch, layers, embedding]
         - hidden_state: torch.Tensor -> previous GRU state [batch, hidden_dim]
+        - time_index: int -> predicted bin, passed to the query builder
 
     OUTPUT:
         - context: torch.Tensor -> attended GRU input [batch, hidden_dim]
         - attention_weights: torch.Tensor -> [batch, layers, embedding]
     """
-    def _compute_feature_attention(self, normalized_features, hidden_state):
-        # The recurrent state is the only time-varying attention query.
-        query = self.hidden_query_projection(hidden_state)
+    def _compute_feature_attention(
+        self, normalized_features, hidden_state, time_index=0
+    ):
+        query = self._build_attention_query(hidden_state, time_index)
         attention_logits = torch.einsum(
             "ba,lea->ble",
             query,
@@ -1377,15 +1443,36 @@ class ShowAttendTellGRUModel(nn.Module):
 
         # Initialize h_0 from the mean layer representation of each image.
         hidden_state = self.initial_state(normalized_features.mean(dim=1))
+        return self._unroll(
+            normalized_features,
+            hidden_state,
+            return_hidden_states,
+        )
+    # EOF
+
+    """
+    _unroll
+    Run the shared attention, GRU, and readout from a given initial state.
+
+    INPUT:
+        - normalized_features: torch.Tensor -> [batch, layers, embedding]
+        - hidden_state: torch.Tensor -> initial GRU state [batch, hidden_dim]
+        - return_hidden_states: bool -> also return the recurrent state sequence
+
+    OUTPUT:
+        - see forward
+    """
+    def _unroll(self, normalized_features, hidden_state, return_hidden_states):
         prediction_sequence = []
         attention_sequence = []
         hidden_sequence = []
 
         # Reuse the same attention, GRU, and readout parameters at every bin.
-        for _ in range(self.n_timepoints):
+        for time_index in range(self.n_timepoints):
             context, attention_weights = self._compute_feature_attention(
                 normalized_features,
                 hidden_state,
+                time_index,
             )
             hidden_state = self.recurrence(context, hidden_state)
             prediction_sequence.append(

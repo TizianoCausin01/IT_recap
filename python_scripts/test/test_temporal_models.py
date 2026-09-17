@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 
@@ -170,6 +171,45 @@ def test_show_attend_tell_gru_shapes_and_feature_attention():
     attention_mass = attention.flatten(start_dim=-2).sum(dim=-1)
     torch.testing.assert_close(attention_mass, torch.ones_like(attention_mass))
     assert torch.isfinite(predictions).all()
+# EOF
+
+
+def test_show_attend_tell_gru_supports_cached_features_without_encoder():
+    layer_features = torch.randn(3, 2, ENCODER_DIM)
+    model = ShowAttendTellGRUModel(
+        None,
+        layers=["layer_a", "layer_b"],
+        n_timepoints=5,
+        n_neurons=4,
+        hidden_dim=8,
+        attention_dim=6,
+        encoder_dim=ENCODER_DIM,
+    )
+
+    predictions, attention = model(
+        layer_features,
+        use_precomputed_features=True,
+    )
+    assert predictions.shape == (3, 5, 4)
+    assert attention.shape == (3, 5, 2, ENCODER_DIM)
+    assert model.get_encoder() is None
+# EOF
+
+
+def test_cached_only_gru_rejects_online_image_inputs():
+    model = ShowAttendTellGRUModel(
+        None,
+        layers=["layer_a", "layer_b"],
+        n_timepoints=5,
+        n_neurons=4,
+        hidden_dim=8,
+        attention_dim=6,
+        encoder_dim=ENCODER_DIM,
+    )
+
+    with pytest.raises(ValueError, match="require an encoder"):
+        model(torch.randn(2, 3, 224, 224), use_precomputed_features=False)
+    # end with rejected online images
 # EOF
 
 
