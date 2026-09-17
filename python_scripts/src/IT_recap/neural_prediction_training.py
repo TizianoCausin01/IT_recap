@@ -154,13 +154,15 @@ def training_step(
 
     # Train the decoder; BaselineModel keeps its frozen backbone in eval mode.
     net.train()
-    for inputs, targets in data_loader:
-        inputs = inputs.to(device)
+    # Batches are (*inputs, targets); extra inputs such as an observed early
+    # response are passed to the model positionally after the image input.
+    for *inputs, targets in data_loader:
+        inputs = [tensor.to(device) for tensor in inputs]
         targets = targets.to(device)
 
         # Compute the aligned time-bin loss and update trainable parameters.
         predictions, _ = net(
-            inputs,
+            *inputs,
             use_precomputed_features=use_precomputed_features,
         )
         loss = cost_function(predictions, targets)
@@ -169,7 +171,7 @@ def training_step(
         optimizer.zero_grad(set_to_none=True)
 
         # Weight every batch mean by its number of samples for the epoch mean.
-        batch_samples = inputs.shape[0]
+        batch_samples = targets.shape[0]
         samples += batch_samples
         cumulative_loss += loss.item() * batch_samples
     # end for training batch
@@ -205,16 +207,16 @@ def test_step(
 
     # Validation never builds gradients or updates model parameters.
     with torch.no_grad():
-        for inputs, targets in data_loader:
-            inputs = inputs.to(device)
+        for *inputs, targets in data_loader:
+            inputs = [tensor.to(device) for tensor in inputs]
             targets = targets.to(device)
             predictions, _ = net(
-                inputs,
+                *inputs,
                 use_precomputed_features=use_precomputed_features,
             )
             loss = cost_function(predictions, targets)
 
-            batch_samples = inputs.shape[0]
+            batch_samples = targets.shape[0]
             samples += batch_samples
             cumulative_loss += loss.item() * batch_samples
         # end for validation batch
@@ -467,9 +469,9 @@ def minimum_repetition_test_step(
     # Collect the complete validation pool because repetitions of one image can
     # occur in different batches.
     with torch.no_grad():
-        for inputs, targets in data_loader:
+        for *inputs, targets in data_loader:
             predictions, _ = net(
-                inputs.to(device),
+                *[tensor.to(device) for tensor in inputs],
                 use_precomputed_features=use_precomputed_features,
             )
             prediction_batches.append(predictions.cpu().numpy())
@@ -523,11 +525,11 @@ def plot_mean_channel_reconstruction(
     # end if sample_index is invalid
 
     # Reconstruct the same validation example without tracking gradients.
-    model_input, target = validation_dataset[sample_index]
+    *model_inputs, target = validation_dataset[sample_index]
     net.eval()
     with torch.no_grad():
         prediction, _ = net(
-            model_input.unsqueeze(0).to(device),
+            *[tensor.unsqueeze(0).to(device) for tensor in model_inputs],
             use_precomputed_features=use_precomputed_features,
         )
     # end with no gradient tracking
@@ -570,6 +572,8 @@ INPUT:
     - data_loader: DataLoader -> aligned inputs and neural targets
     - use_precomputed_features: bool -> whether inputs bypass the image encoder
     - device: torch.device | str -> feature-extraction device
+    - append_extra_inputs: bool -> also append every further flattened input
+      of a (*inputs, targets) batch, e.g. an observed early response
 
 OUTPUT:
     - features: np.ndarray -> samples by concatenated layer features
@@ -580,6 +584,7 @@ def collect_concatenated_layer_regression_data(
     data_loader,
     use_precomputed_features,
     device="cpu",
+    append_extra_inputs=False,
 ):
     feature_batches = []
     target_batches = []
@@ -587,15 +592,20 @@ def collect_concatenated_layer_regression_data(
     # Keep the frozen image backbone deterministic during feature collection.
     net.eval()
     with torch.no_grad():
-        for inputs, targets in data_loader:
-            inputs = inputs.to(device)
+        for image_inputs, *extra_inputs, targets in data_loader:
             layer_features = net._resolve_layer_features(
-                inputs,
+                image_inputs.to(device),
                 use_precomputed_features,
             )
-            feature_batches.append(
-                layer_features.flatten(start_dim=1).cpu().numpy()
-            )
+            # [samples, layers * embedding (+ flattened extra inputs)]
+            design_columns = [layer_features.flatten(start_dim=1).cpu()]
+            if append_extra_inputs:
+                design_columns += [
+                    tensor.flatten(start_dim=1).to(design_columns[0].dtype)
+                    for tensor in extra_inputs
+                ]
+            # end if extra inputs enter the design matrix
+            feature_batches.append(torch.cat(design_columns, dim=1).numpy())
             target_batches.append(targets.flatten(start_dim=1).cpu().numpy())
         # end for data batch
     # end with no gradient tracking
@@ -1099,9 +1109,9 @@ def collect_neural_predictions(
 
     net.eval()
     with torch.no_grad():
-        for inputs, targets in data_loader:
+        for *inputs, targets in data_loader:
             predictions, _ = net(
-                inputs.to(device),
+                *[tensor.to(device) for tensor in inputs],
                 use_precomputed_features=use_precomputed_features,
             )
             prediction_batches.append(predictions.cpu().numpy())

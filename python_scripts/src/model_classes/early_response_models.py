@@ -20,6 +20,11 @@ parameter for parameter, which is the ablation this experiment is read against.
 import torch
 from torch import nn
 
+from model_classes.temporal_models import (
+    GAUSSIAN_NOISE_LAYER_NAME,
+    ShowAttendTellGRUModel,
+    sample_sphere_noise_layer,
+)
 from model_classes.timebin_models import (
     GRUTimebinDecoder,
     LinearDynamicalSystemDecoder,
@@ -357,6 +362,203 @@ class EarlyResponseLDSDecoder(LinearDynamicalSystemDecoder):
             # end if the decoder observed the early trace
         # end if diagnostics are requested
         return predictions, diagnostics
+    # EOF
+# EOC
+
+
+class EarlyResponseShowAttendTellGRUModel(ShowAttendTellGRUModel):
+    """
+    The Show-Attend-and-Tell GRU, started from the observed pre-response state.
+
+    Attention, recurrence, and readout are those of ShowAttendTellGRUModel. The
+    only change is h_0: the parent maps the mean image layer to the initial
+    state, whereas here the same map also reads a code of the presentation's
+    own first neural bins (0-50 ms, before IT latency). The recurrence therefore
+    rolls the remaining bins forward from where the recording actually was.
+
+    Optionally, as in NoiseLayerBaselineModel, attention also ranges over one
+    extra pseudo-layer drawn uniformly on the sphere for every image and pass.
+    It carries no stimulus information, so attention mass spent on it is wasted
+    prediction budget. The draw is appended after the per-layer normalization
+    and does not enter h_0, which reads the real layers only.
+
+    Optionally, a learned embedding per predicted bin is added to the
+    state-derived query, W_h h_(t-1) + e_t, so the attention schedule can change
+    over time even when the recurrent state settles. The time variation of
+    attention is then partly a learned clock rather than purely state-driven.
+
+    INPUT (forward):
+        - x: torch.Tensor -> images or cached features [batch, layers, embedding]
+        - early_response: torch.Tensor -> [batch, early bins, neurons]
+        - use_precomputed_features: bool -> whether x is cached features
+        - return_hidden_states: bool -> also return the recurrent state sequence
+
+    OUTPUT:
+        - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
+        - attention_weights: torch.Tensor -> [batch, time, layers, embedding],
+          with layers + 1 attended items when the noise layer is used
+        - hidden_states: torch.Tensor -> [batch, time, hidden_dim], only when
+          return_hidden_states is True
+    """
+
+    """
+    __init__
+    Build the parent decoder, then widen its initial-state map by the early code.
+
+    INPUT:
+        - encoder, layers, n_timepoints, n_neurons, hidden_dim, attention_dim,
+          dropout, encoder_dim: see ShowAttendTellGRUModel; n_timepoints counts
+          the predicted bins only, without the observed early bins
+        - n_early_bins: int -> observed early bins, 5 for 0-50 ms at 100 Hz
+        - early_dim: int -> width of the early state code
+        - early_dropout: float -> dropout on the early state code
+        - use_noise_layer: bool -> attend over one extra sphere-noise layer
+        - match_noise_norm: bool -> scale the noise to the mean real-layer norm
+        - noise_in_eval: bool -> keep sampling noise outside training mode;
+          otherwise the noise item is a zero vector
+        - use_temporal_embeddings: bool -> add a learned per-bin embedding
+          [n_timepoints, attention_dim] to the attention query
+
+    OUTPUT:
+        - None
+    """
+    def __init__(
+        self,
+        encoder,
+        layers,
+        n_timepoints,
+        n_neurons,
+        hidden_dim,
+        attention_dim,
+        n_early_bins,
+        early_dim=64,
+        dropout=0.0,
+        early_dropout=0.0,
+        encoder_dim=None,
+        use_noise_layer=False,
+        match_noise_norm=True,
+        noise_in_eval=True,
+        use_temporal_embeddings=False,
+    ):
+        super().__init__(
+            encoder,
+            layers=layers,
+            n_timepoints=n_timepoints,
+            n_neurons=n_neurons,
+            hidden_dim=hidden_dim,
+            attention_dim=attention_dim,
+            dropout=dropout,
+            encoder_dim=encoder_dim,
+        )
+        self.n_early_bins = int(n_early_bins)
+        self.early_encoder = EarlyResponseEncoder(
+            self.n_early_bins, self.n_neurons, early_dim, early_dropout
+        )
+        # Same Linear + Tanh as the parent, reading [image mean, early code].
+        self.initial_state = nn.Sequential(
+            nn.Linear(self.encoder_dim + early_dim, self.hidden_dim),
+            nn.Tanh(),
+        )
+
+        self.use_noise_layer = bool(use_noise_layer)
+        self.match_noise_norm = bool(match_noise_norm)
+        self.noise_in_eval = bool(noise_in_eval)
+        if self.use_noise_layer:
+            # n_layers stays at the real count so cached inputs still validate;
+            # only the parameters indexed by attended item are rebuilt at L + 1.
+            n_attended_items = self.n_layers + 1
+            self.n_attention_features = n_attended_items * self.encoder_dim
+            self.feature_key_embeddings = nn.Parameter(
+                torch.empty(n_attended_items, self.encoder_dim, self.attention_dim)
+            )
+            nn.init.normal_(self.feature_key_embeddings, mean=0.0, std=0.02)
+            self.context_projection = nn.Linear(
+                self.n_attention_features,
+                self.hidden_dim,
+                bias=False,
+            )
+        # end if attention also ranges over the noise pseudo-layer
+
+        # Only the time-embedding variant owns time-indexed parameters, so the
+        # default model keeps the parent's state-only query exactly.
+        self.use_temporal_embeddings = bool(use_temporal_embeddings)
+        self.temporal_query_embeddings = None
+        if self.use_temporal_embeddings:
+            self.temporal_query_embeddings = nn.Parameter(
+                torch.randn(self.n_timepoints, self.attention_dim) * 0.02
+            )
+        # end if the query also reads a learned per-bin embedding
+
+    def get_n_early_bins(self) -> int:
+        return self.n_early_bins
+
+    def get_layer_names(self) -> list[str]:
+        # Names of the attended items, i.e. the attention layer axis.
+        if self.use_noise_layer:
+            return [*self.layer_names, GAUSSIAN_NOISE_LAYER_NAME]
+        # end if the noise pseudo-layer is attended
+        return self.layer_names
+
+    """
+    _build_attention_query
+    State query, plus the learned embedding of the predicted bin when enabled.
+
+    INPUT:
+        - hidden_state: torch.Tensor -> previous GRU state [batch, hidden_dim]
+        - time_index: int -> predicted bin
+
+    OUTPUT:
+        - query: torch.Tensor -> [batch, attention_dim]
+    """
+    def _build_attention_query(self, hidden_state, time_index):
+        query = self.hidden_query_projection(hidden_state)
+        if self.temporal_query_embeddings is not None:
+            # [attention_dim] broadcasts over the batch axis.
+            query = query + self.temporal_query_embeddings[time_index]
+        # end if the query reads the per-bin embedding
+        return query
+    # EOF
+
+    def forward(
+        self,
+        x,
+        early_response,
+        use_precomputed_features=False,
+        return_hidden_states=False,
+    ):
+        layer_features = self._resolve_layer_features(
+            x,
+            use_precomputed_features,
+        )
+        normalized_features = self.feature_input_norm(layer_features)
+
+        # h_0 reads the mean image layer and the early code: [batch, hidden_dim].
+        early_code = self.early_encoder(
+            early_response.to(dtype=normalized_features.dtype)
+        )
+        hidden_state = self.initial_state(
+            torch.cat([normalized_features.mean(dim=1), early_code], dim=-1)
+        )
+
+        if self.use_noise_layer:
+            if self.training or self.noise_in_eval:
+                noise_layer = sample_sphere_noise_layer(
+                    normalized_features, self.match_noise_norm
+                )
+            else:
+                # Keep the attended item but make evaluation deterministic.
+                noise_layer = torch.zeros_like(normalized_features[:, :1])
+            # end if the noise layer is sampled or silenced
+            # [batch, layers, embedding] -> [batch, layers + 1, embedding]
+            normalized_features = torch.cat(
+                [normalized_features, noise_layer], dim=1
+            )
+        # end if attention also ranges over the noise pseudo-layer
+        return self._unroll(
+            normalized_features,
+            hidden_state,
+            return_hidden_states,
+        )
     # EOF
 # EOC
 

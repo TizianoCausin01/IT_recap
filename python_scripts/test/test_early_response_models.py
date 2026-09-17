@@ -1,4 +1,5 @@
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -311,4 +312,171 @@ def test_rescaling_cannot_help_an_uninformative_prediction():
     rescaled = optimally_rescaled_mse(predictions, targets)
     # The best a useless prediction can do is the target's own variance.
     assert rescaled == pytest.approx(targets.var(axis=0).mean(), rel=0.1)
+# EOF
+
+
+def build_early_attention_gru(n_early_bins=3, **noise_kwargs):
+    from model_classes.early_response_models import (
+        EarlyResponseShowAttendTellGRUModel,
+    )
+
+    torch.manual_seed(0)
+    return EarlyResponseShowAttendTellGRUModel(
+        None,
+        layers=["layer_a", "layer_b"],
+        n_timepoints=4,
+        n_neurons=5,
+        hidden_dim=8,
+        attention_dim=6,
+        n_early_bins=n_early_bins,
+        early_dim=7,
+        encoder_dim=16,
+        **noise_kwargs,
+    )
+# EOF
+
+
+def test_early_attention_gru_shapes_and_initial_state_reads_early_bins():
+    model = build_early_attention_gru().eval()
+    features = torch.randn(2, 2, 16)
+    early_response = torch.randn(2, 3, 5)
+
+    predictions, attention, hidden = model(
+        features,
+        early_response,
+        use_precomputed_features=True,
+        return_hidden_states=True,
+    )
+    assert predictions.shape == (2, 4, 5)
+    assert attention.shape == (2, 4, 2, 16)
+    assert hidden.shape == (2, 4, 8)
+
+    # A different pre-response state must change the predicted trajectory.
+    shifted_predictions, _ = model(
+        features,
+        torch.randn(2, 3, 5),
+        use_precomputed_features=True,
+    )
+    assert not torch.allclose(predictions, shifted_predictions)
+# EOF
+
+
+def test_early_response_dataset_and_helpers_accept_three_tensor_batches():
+    from torch.utils.data import DataLoader
+
+    from IT_recap.dynamic_drsa import collect_gru_time_series
+    from IT_recap.neural_prediction_training import (
+        collect_concatenated_layer_regression_data,
+        collect_neural_predictions,
+        neural_activity_weighted_mse_loss,
+        training_step,
+    )
+    from project_specific_utils.dataloader import (
+        EarlyResponseInputDataset,
+        NeuralInputDataset,
+    )
+
+    # 6 trials over 3 images; full window of 7 bins = 3 early + 4 target.
+    neural_activity = np.random.default_rng(0).normal(size=(5, 7, 6))
+    full_dataset = NeuralInputDataset(
+        image_dataset=[None] * 3,
+        activations=np.random.default_rng(1).normal(size=(3, 2, 16)),
+        neural_activity=neural_activity,
+        image_indices=[0, 1, 2, 0, 1, 2],
+        input_mode="activations",
+    )
+    dataset = EarlyResponseInputDataset(full_dataset, n_early_bins=3)
+    features, early_response, target = dataset[4]
+    assert features.shape == (2, 16)
+    assert early_response.shape == (3, 5)
+    assert target.shape == (4, 5)
+    np.testing.assert_allclose(
+        early_response.numpy(), neural_activity[:, :3, 4].T, rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        target.numpy(), neural_activity[:, 3:, 4].T, rtol=1e-6
+    )
+
+    model = build_early_attention_gru()
+    loader = DataLoader(dataset, batch_size=4, shuffle=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    loss = training_step(
+        model,
+        loader,
+        optimizer,
+        partial(neural_activity_weighted_mse_loss, weights=torch.ones(4, 5)),
+        use_precomputed_features=True,
+    )
+    assert np.isfinite(loss)
+
+    predictions, targets = collect_neural_predictions(model, loader, True)
+    assert predictions.shape == targets.shape == (6, 4, 5)
+    _, hidden, _ = collect_gru_time_series(model, loader, True)
+    assert hidden.shape == (6, 4, 8)
+
+    image_only, _ = collect_concatenated_layer_regression_data(
+        model, loader, True
+    )
+    with_early, flat_targets = collect_concatenated_layer_regression_data(
+        model, loader, True, append_extra_inputs=True
+    )
+    assert image_only.shape == (6, 32)
+    assert with_early.shape == (6, 32 + 15)
+    assert flat_targets.shape == (6, 20)
+# EOF
+
+
+def test_early_attention_gru_noise_layer_adds_one_attended_item():
+    features = torch.randn(2, 2, 16)
+    early_response = torch.randn(2, 3, 5)
+    model = build_early_attention_gru(use_noise_layer=True).eval()
+
+    predictions, attention = model(
+        features, early_response, use_precomputed_features=True
+    )
+    assert predictions.shape == (2, 4, 5)
+    assert attention.shape == (2, 4, 3, 16)
+    assert len(model.get_layer_names()) == 3
+    # noise_in_eval defaults to True, so evaluation stays stochastic.
+    repeated_predictions, _ = model(
+        features, early_response, use_precomputed_features=True
+    )
+    assert not torch.allclose(predictions, repeated_predictions)
+
+    silent_model = build_early_attention_gru(
+        use_noise_layer=True, noise_in_eval=False
+    ).eval()
+    first, _ = silent_model(features, early_response, use_precomputed_features=True)
+    second, _ = silent_model(features, early_response, use_precomputed_features=True)
+    torch.testing.assert_close(first, second)
+# EOF
+
+
+def test_early_attention_gru_temporal_embeddings_are_optional_and_used():
+    features = torch.randn(2, 2, 16)
+    early_response = torch.randn(2, 3, 5)
+    plain_model = build_early_attention_gru()
+    assert plain_model.temporal_query_embeddings is None
+
+    model = build_early_attention_gru(use_temporal_embeddings=True).eval()
+    assert model.temporal_query_embeddings.shape == (4, 6)
+    predictions, attention = model(
+        features, early_response, use_precomputed_features=True
+    )
+    assert attention.shape == (2, 4, 2, 16)
+
+    # Changing one bin's embedding changes attention from that bin onwards only.
+    with torch.no_grad():
+        model.temporal_query_embeddings[2] += 5.0
+    _, shifted_attention = model(
+        features, early_response, use_precomputed_features=True
+    )
+    torch.testing.assert_close(attention[:, :2], shifted_attention[:, :2])
+    assert not torch.allclose(attention[:, 2], shifted_attention[:, 2])
+
+    # Embeddings receive gradients, i.e. they reach the loss.
+    model.train()
+    predictions, _ = model(features, early_response, use_precomputed_features=True)
+    predictions.pow(2).mean().backward()
+    assert model.temporal_query_embeddings.grad.abs().sum() > 0
 # EOF

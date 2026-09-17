@@ -246,10 +246,9 @@ def collect_gru_time_series(
 
     net.eval()
     with torch.no_grad():
-        for inputs, targets in data_loader:
-            inputs = inputs.to(device)
+        for *inputs, targets in data_loader:
             predictions, _, hidden_states = net(
-                inputs,
+                *[tensor.to(device) for tensor in inputs],
                 use_precomputed_features=use_precomputed_features,
                 return_hidden_states=True,
             )

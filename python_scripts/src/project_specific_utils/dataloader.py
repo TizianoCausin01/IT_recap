@@ -570,6 +570,63 @@ class NeuralInputDataset(Dataset):
 # EOC
 
 
+class EarlyResponseInputDataset(Dataset):
+    """
+    Split every neural response into an observed early input and a target.
+
+    Wraps a NeuralInputDataset whose targets span the full recorded window.
+    The first n_early_bins become a second model input -- the pre-response
+    state -- and only the remaining bins are returned as the target, so a model
+    is never scored on the bins it observes.
+
+    INPUT (__getitem__):
+        - index: int -> neural trial index
+
+    OUTPUT:
+        - model_input: torch.Tensor -> image or cached [layers, embedding]
+        - early_response: torch.Tensor -> observed bins [n_early_bins, neurons]
+        - target: torch.Tensor -> predicted bins [time - n_early_bins, neurons]
+    """
+
+    """
+    __init__
+    Store the wrapped dataset and validate the early window length.
+
+    INPUT:
+        - neural_input_dataset: NeuralInputDataset -> full-window aligned pairs
+        - n_early_bins: int -> leading bins moved from target to input
+
+    OUTPUT:
+        - None
+    """
+    def __init__(self, neural_input_dataset, n_early_bins):
+        n_timepoints = neural_input_dataset.neural_activity.shape[1]
+        if not 0 < n_early_bins < n_timepoints:
+            raise ValueError(
+                f"n_early_bins must lie in (0, {n_timepoints}), "
+                f"got {n_early_bins}."
+            )
+        # end if the early window leaves no target bins
+        self.neural_input_dataset = neural_input_dataset
+        self.n_early_bins = int(n_early_bins)
+        # Expose the attributes the training notebooks read from the dataset.
+        self.input_mode = neural_input_dataset.input_mode
+        self.image_indices = neural_input_dataset.image_indices
+
+    def __len__(self):
+        return len(self.neural_input_dataset)
+    # EOF
+
+    def __getitem__(self, index):
+        model_input, response = self.neural_input_dataset[index]
+        # response: [time, neurons] -> early [:n_early] and target [n_early:]
+        early_response = response[:self.n_early_bins]
+        target = response[self.n_early_bins:]
+        return model_input, early_response, target
+    # EOF
+# EOC
+
+
 """
 make_neural_input_loader
 Build an aligned loader that returns images or cached ANN activations.
