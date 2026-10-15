@@ -189,6 +189,7 @@ def _(Path, dataclass, field, os, sys, yaml):
         selection_metric: str = "stim_r"
         temporal_embedding_dim: int = 128
         value_dim: int = 128
+        n_attention_heads: int = 1
         mlp_hidden_dim: int = 64
         dropout: float = 0.5
         attention_granularity: str = "layer"

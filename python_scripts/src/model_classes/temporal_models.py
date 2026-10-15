@@ -378,6 +378,8 @@ class BaselineModel(nn.Module):
           the learned temporal queries, independently of the decoder dropout
         - key_query_dim: int | None -> optional shared key/query width
         - attention_granularity: str -> "layer" or "feature"
+        - n_attention_heads: int -> independent attention heads; must divide
+          both the key/query width and value width
 
     OUTPUT:
         - None
@@ -396,6 +398,7 @@ class BaselineModel(nn.Module):
         temporal_embedding_dropout=0.0,
         key_query_dim=None,
         attention_granularity="layer",
+        n_attention_heads=1,
     ):
         super().__init__()
 
@@ -473,6 +476,25 @@ class BaselineModel(nn.Module):
         )
         self.query_dim = self.key_dim
         self.value_dim = value_dim
+        integer_n_attention_heads = int(n_attention_heads)
+        if (
+            integer_n_attention_heads <= 0
+            or integer_n_attention_heads != n_attention_heads
+        ):
+            raise ValueError("n_attention_heads must be a positive integer.")
+        # end if the attention head count is invalid
+        if (
+            self.key_dim % integer_n_attention_heads != 0
+            or self.value_dim % integer_n_attention_heads != 0
+        ):
+            raise ValueError(
+                "key/query and value dimensions must be divisible by "
+                "n_attention_heads."
+            )
+        # end if attention widths cannot be split evenly across heads
+        self.n_attention_heads = integer_n_attention_heads
+        self.head_key_dim = self.key_dim // self.n_attention_heads
+        self.head_value_dim = self.value_dim // self.n_attention_heads
 
         # Whole-layer mode preserves the original L-item cross-attention. In
         # feature mode, every one of the L * E embedding coordinates receives a
@@ -605,6 +627,9 @@ class BaselineModel(nn.Module):
     def get_attention_granularity(self) -> str:
         return self.attention_granularity
 
+    def get_n_attention_heads(self) -> int:
+        return self.n_attention_heads
+
     def get_trainable_parameters(self):
         return (
             parameter
@@ -685,10 +710,41 @@ class BaselineModel(nn.Module):
         values = self.dropout(
             self.value_norm(self.value_projection(layer_features))
         )
+        # Split the projected widths into heads. Each head selects ANN layers
+        # independently before its value slice is concatenated with the others.
+        batch_size, n_timepoints = queries.shape[:2]
+        queries = queries.reshape(
+            batch_size,
+            n_timepoints,
+            self.n_attention_heads,
+            self.head_key_dim,
+        ).transpose(1, 2)
+        keys = keys.reshape(
+            batch_size,
+            self.n_layers,
+            self.n_attention_heads,
+            self.head_key_dim,
+        ).permute(0, 2, 1, 3)
+        values = values.reshape(
+            batch_size,
+            self.n_layers,
+            self.n_attention_heads,
+            self.head_value_dim,
+        ).permute(0, 2, 1, 3)
+
         attention_logits = torch.matmul(queries, keys.transpose(-1, -2))
-        attention_logits = attention_logits / math.sqrt(self.key_dim)
-        attention_weights = torch.softmax(attention_logits, dim=-1)
-        coarse_latents = torch.matmul(attention_weights, values)
+        attention_logits = attention_logits / math.sqrt(self.head_key_dim)
+        head_attention_weights = torch.softmax(attention_logits, dim=-1)
+        head_latents = torch.matmul(head_attention_weights, values)
+        coarse_latents = head_latents.transpose(1, 2).reshape(
+            batch_size,
+            n_timepoints,
+            self.value_dim,
+        )
+
+        # Downstream analyses expect [B, T, L], so expose the standard mean
+        # across heads while retaining head-specific weights in the computation.
+        attention_weights = head_attention_weights.mean(dim=1)
         return coarse_latents, attention_weights
     # EOF
 
@@ -712,32 +768,60 @@ class BaselineModel(nn.Module):
         # Contract queries with the learned coordinate keys before applying the
         # stimulus activation. This avoids materializing [B, L, E, E_k].
         feature_key_embeddings = self.dropout(self.feature_key_embeddings)
+        batch_size, n_timepoints = queries.shape[:2]
+        queries = queries.reshape(
+            batch_size,
+            n_timepoints,
+            self.n_attention_heads,
+            self.head_key_dim,
+        ).permute(0, 2, 1, 3)
+        feature_key_embeddings = feature_key_embeddings.reshape(
+            self.n_layers,
+            self.encoder_dim,
+            self.n_attention_heads,
+            self.head_key_dim,
+        ).permute(2, 0, 1, 3)
         attention_logits = torch.einsum(
-            "btk,lek->btle",
+            "bhtk,hlek->bhtle",
             queries,
             feature_key_embeddings,
         )
-        attention_logits = (
-            attention_logits * normalized_features.unsqueeze(1)
-        )
+        attention_logits = attention_logits * normalized_features[:, None, None]
 
         # Each temporal query scores all L * E individual feature coordinates.
-        attention_logits = attention_logits / math.sqrt(self.key_dim)
+        attention_logits = attention_logits / math.sqrt(self.head_key_dim)
         flat_logits = attention_logits.flatten(start_dim=-2)
-        attention_weights = torch.softmax(flat_logits, dim=-1).reshape_as(
+        head_attention_weights = torch.softmax(flat_logits, dim=-1).reshape_as(
             attention_logits
         )
 
         # Uniform attention should initially preserve the normalized feature
         # scale. Multiplication by L * E makes a uniform gate equal to one.
         gated_features = (
-            normalized_features.unsqueeze(1)
-            * attention_weights
+            normalized_features[:, None, None]
+            * head_attention_weights
             * self.n_attention_features
         )
         flat_gated_features = gated_features.flatten(start_dim=-2)
-        coarse_latents = self.feature_value_projection(flat_gated_features)
+        value_projection = self.feature_value_projection.weight.reshape(
+            self.n_attention_heads,
+            self.head_value_dim,
+            self.n_attention_features,
+        )
+        head_latents = torch.einsum(
+            "bhtf,hvf->bhtv",
+            flat_gated_features,
+            value_projection,
+        )
+        coarse_latents = head_latents.permute(0, 2, 1, 3).reshape(
+            batch_size,
+            n_timepoints,
+            self.value_dim,
+        )
         coarse_latents = self.dropout(self.value_norm(coarse_latents))
+
+        # Preserve the public attention shape by averaging diagnostics over heads.
+        attention_weights = head_attention_weights.mean(dim=1)
         return coarse_latents, attention_weights
     # EOF
 
@@ -905,6 +989,8 @@ class NoiseLayerBaselineModel(BaselineModel):
         - match_noise_norm: bool -> rescale the sphere draw to the mean norm of
           that image's real layer vectors, so it competes on equal footing
         - noise_in_eval: bool -> keep sampling noise outside training mode
+        - n_attention_heads: int -> independent attention heads; must divide
+          both the key/query width and value width
         - baseline_kwargs: dict -> remaining BaselineModel arguments
 
     OUTPUT:
@@ -916,9 +1002,15 @@ class NoiseLayerBaselineModel(BaselineModel):
         layers,
         match_noise_norm=True,
         noise_in_eval=True,
+        n_attention_heads=1,
         **baseline_kwargs,
     ):
-        super().__init__(encoder, layers, **baseline_kwargs)
+        super().__init__(
+            encoder,
+            layers,
+            n_attention_heads=n_attention_heads,
+            **baseline_kwargs,
+        )
         self.match_noise_norm = bool(match_noise_norm)
         self.noise_in_eval = bool(noise_in_eval)
 

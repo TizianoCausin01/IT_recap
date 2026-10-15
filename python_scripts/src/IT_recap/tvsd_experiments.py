@@ -1618,6 +1618,7 @@ def build_variant_model(variant, encoder, cfg, n_timepoints, n_neurons):
         "mlp_hidden_dim": cfg.mlp_hidden_dim,
         "dropout": cfg.dropout,
         "attention_granularity": cfg.attention_granularity,
+        "n_attention_heads": cfg.n_attention_heads,
     }
     if variant == "baseline":
         return BaselineModel(encoder, layers=cfg.layer_names, **shared_kwargs)

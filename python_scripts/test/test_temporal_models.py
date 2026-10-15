@@ -11,6 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "python_scripts" / "src"))
 
 from model_classes.temporal_models import (  # noqa: E402
     BaselineModel,
+    NoiseLayerBaselineModel,
     ShowAttendTellGRUModel,
     TemporalNoiseBaselineModel,
 )
@@ -146,6 +147,50 @@ def test_query_dropout_reaches_feature_granularity_predictions():
 
     assert not torch.allclose(first_predictions, second_predictions)
     assert torch.isfinite(first_predictions).all()
+# EOF
+
+
+@pytest.mark.parametrize("attention_granularity", ["layer", "feature"])
+def test_noise_layer_baseline_supports_multiple_attention_heads(
+    attention_granularity,
+):
+    layer_features = torch.randn(3, 2, ENCODER_DIM)
+    model = build_model(
+        NoiseLayerBaselineModel,
+        0.0,
+        n_attention_heads=4,
+        attention_granularity=attention_granularity,
+        noise_in_eval=False,
+    ).eval()
+
+    predictions, attention = model(
+        layer_features,
+        use_precomputed_features=True,
+    )
+
+    expected_attention_shape = (3, 5, 3)
+    if attention_granularity == "feature":
+        expected_attention_shape = (*expected_attention_shape, ENCODER_DIM)
+    # end if attention operates over individual embedding coordinates
+    assert model.get_n_attention_heads() == 4
+    assert predictions.shape == (3, 5, 4)
+    assert attention.shape == expected_attention_shape
+    torch.testing.assert_close(
+        attention.flatten(start_dim=2).sum(dim=-1),
+        torch.ones(3, 5),
+    )
+    assert torch.isfinite(predictions).all()
+# EOF
+
+
+def test_attention_head_count_must_divide_key_and_value_widths():
+    with pytest.raises(ValueError, match="must be divisible"):
+        build_model(
+            NoiseLayerBaselineModel,
+            0.0,
+            n_attention_heads=3,
+        )
+    # end with incompatible head count
 # EOF
 
 

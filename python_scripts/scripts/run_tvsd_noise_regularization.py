@@ -117,6 +117,7 @@ class Cfg:
     weight_decay: float = 1e-4
     temporal_embedding_dim: int = 128
     value_dim: int = 128
+    n_attention_heads: int = 1
     mlp_hidden_dim: int = 64
     dropout: float = 0.2
     attention_granularity: str = "layer"
