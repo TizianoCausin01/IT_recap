@@ -317,3 +317,35 @@ def test_site_token_baseline_gives_each_site_its_own_query(
     )
     assert not torch.allclose(predictions, tied_predictions)
 # EOF
+
+
+def test_site_token_single_site_passes_pool_to_the_joint_pass():
+    # Stacking one pass per site token must reproduce the all-sites pass, so
+    # training on (image, site) pairs changes the sampling, not the function.
+    layer_features = torch.randn(3, 2, ENCODER_DIM)
+    model = build_model(SiteTokenBaselineModel, 0.0, attention_granularity="feature").eval()
+    joint_predictions, _ = model(layer_features, use_precomputed_features=True)
+    pooled_predictions = torch.stack(
+        [
+            model(
+                layer_features,
+                use_precomputed_features=True,
+                site_indices=torch.full((3,), site, dtype=torch.long),
+            )[0]
+            for site in range(SHAPES["n_neurons"])
+        ],
+        dim=-1,
+    )
+    torch.testing.assert_close(pooled_predictions, joint_predictions)
+
+    # Mixed sites in one batch pick each image's own site.
+    mixed_sites = torch.tensor([0, 2, 3])
+    mixed_predictions, attention = model(
+        layer_features, use_precomputed_features=True, site_indices=mixed_sites
+    )
+    assert mixed_predictions.shape == (3, 5)
+    assert attention.shape == (3, 5, 2, ENCODER_DIM)
+    torch.testing.assert_close(
+        mixed_predictions, joint_predictions[torch.arange(3), :, mixed_sites]
+    )
+# EOF

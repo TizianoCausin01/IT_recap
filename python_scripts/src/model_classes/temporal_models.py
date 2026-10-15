@@ -1207,14 +1207,21 @@ class SiteTokenBaselineModel(BaselineModel):
     with BaselineModel, the site population is no longer read out jointly
     from one latent per time bin.
 
+    Sites never interact, so predicting all of them in one pass is exactly
+    the stack of single-site passes. Passing site_indices runs only one site
+    per image, which lets training sample (image, site) pairs.
+
     INPUT (forward):
         - x: torch.Tensor -> images or cached features
         - use_precomputed_features: bool -> whether x is [batch, layers, embedding]
+        - site_indices: torch.Tensor | None -> [batch] one site per image; None
+          predicts every site
 
     OUTPUT:
-        - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
+        - neural_predictions: torch.Tensor -> activity [batch, time, neurons],
+          or [batch, time] when site_indices is given
         - attention_weights: torch.Tensor -> weights [B, T/R, N, L] or
-          [B, T/R, N, L, E], depending on attention_granularity
+          [B, T/R, N, L, E] (no N axis when site_indices is given)
     """
 
     """
@@ -1241,22 +1248,32 @@ class SiteTokenBaselineModel(BaselineModel):
 
     """
     _build_temporal_queries
-    Combine every temporal embedding with every site token.
+    Combine every temporal embedding with the site tokens of this pass.
 
     INPUT:
         - batch_size: int -> number of images in the current forward pass
+        - site_indices: torch.Tensor | None -> [batch] one site per image, or
+          None for all N sites
 
     OUTPUT:
-        - queries: torch.Tensor -> queries [batch, (T/R) * N, key_dim],
-          time-major so that query index = t * N + n
+        - queries: torch.Tensor -> queries [batch, (T/R) * S, key_dim], with
+          S = N or 1, time-major so that query index = t * S + s
     """
-    def _build_temporal_queries(self, batch_size):
-        # [T/R, 1, E_te] + [1, N, E_te] -> [T/R, N, E_te] -> [(T/R) * N, E_te].
+    def _build_temporal_queries(self, batch_size, site_indices=None):
+        if site_indices is None:
+            # Every image queries every site: [B, S = N, E_te].
+            site_tokens = self.site_embeddings.unsqueeze(0).expand(
+                batch_size, -1, -1
+            )
+        else:
+            # Each image queries only its own sampled site: [B, S = 1, E_te].
+            site_tokens = self.site_embeddings[site_indices].unsqueeze(1)
+        # end if all sites or one site per image
+        # [1, T/R, 1, E_te] + [B, 1, S, E_te] -> [B, (T/R) * S, E_te].
         site_queries = (
-            self.temporal_embeddings[:, None, :]
-            + self.site_embeddings[None, :, :]
-        ).flatten(0, 1)
-        site_queries = site_queries.unsqueeze(0).expand(batch_size, -1, -1)
+            self.temporal_embeddings[None, :, None, :]
+            + site_tokens[:, None, :, :]
+        ).flatten(1, 2)
         site_queries = self.temporal_embedding_dropout(site_queries)
         if hasattr(self, "query_projection"):
             return self.query_projection(site_queries)
@@ -1264,16 +1281,18 @@ class SiteTokenBaselineModel(BaselineModel):
         return site_queries
     # EOF
 
-    def forward(self, x, use_precomputed_features=False):
+    def forward(self, x, use_precomputed_features=False, site_indices=None):
         layer_features = self._resolve_layer_features(
             x,
             use_precomputed_features,
         )
         batch_size = layer_features.shape[0]
-        queries = self._build_temporal_queries(batch_size)
+        # Sites predicted per image in this pass: all N, or the one requested.
+        n_pass_sites = self.n_neurons if site_indices is None else 1
+        queries = self._build_temporal_queries(batch_size, site_indices)
 
         # The attention helpers are agnostic to the query count, so they
-        # return one latent per (time block, site): [B, (T/R) * N, V].
+        # return one latent per (time block, site): [B, (T/R) * S, V].
         if self.attention_granularity == "layer":
             coarse_latents, attention_weights = self._compute_layer_attention(
                 layer_features,
@@ -1286,20 +1305,20 @@ class SiteTokenBaselineModel(BaselineModel):
             )
         # end if attention operates over layers or embedding features
 
-        # [B, (T/R) * N, V] -> [B, T/R, N, R * V] -> [B, T/R, N, R, V].
+        # [B, (T/R) * S, V] -> [B, T/R, S, R * V] -> [B, T/R, S, R, V].
         fine_latent_blocks = self.temporal_feature_mlp(coarse_latents)
         fine_latent_blocks = fine_latent_blocks.reshape(
             batch_size,
             self.n_temporal_embeddings,
-            self.n_neurons,
+            n_pass_sites,
             self.temporal_compression_ratio,
             self.value_dim,
         )
-        # Put the R fine bins next to their block before merging: [B, T, N, V].
+        # Put the R fine bins next to their block before merging: [B, T, S, V].
         fine_latents = fine_latent_blocks.permute(0, 1, 3, 2, 4).reshape(
             batch_size,
             self.n_timepoints,
-            self.n_neurons,
+            n_pass_sites,
             self.value_dim,
         )
         neural_features = self.neural_feature_mlp(fine_latents)
@@ -1314,13 +1333,17 @@ class SiteTokenBaselineModel(BaselineModel):
         # end for time-bin-specific readout
         neural_predictions = torch.stack(timebin_predictions, dim=1)
 
-        # Expose the site axis of the attention: [B, T/R, N, L(, E)].
+        # Expose the site axis of the attention: [B, T/R, S, L(, E)].
         attention_weights = attention_weights.reshape(
             batch_size,
             self.n_temporal_embeddings,
-            self.n_neurons,
+            n_pass_sites,
             *attention_weights.shape[2:],
         )
+        if site_indices is not None:
+            # One site per image: [B, T, 1] -> [B, T], drop the site axis.
+            return neural_predictions.squeeze(-1), attention_weights.squeeze(2)
+        # end if a single site was predicted per image
         return neural_predictions, attention_weights
     # EOF
 # EOC
