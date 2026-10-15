@@ -13,6 +13,7 @@ from model_classes.temporal_models import (  # noqa: E402
     BaselineModel,
     NoiseLayerBaselineModel,
     ShowAttendTellGRUModel,
+    SiteTokenBaselineModel,
     TemporalNoiseBaselineModel,
 )
 
@@ -284,4 +285,35 @@ def test_show_attend_tell_gru_has_one_recurrent_layer_and_no_time_parameters():
         for name in trainable_names
     )
     assert not has_time_parameter
+# EOF
+
+
+@pytest.mark.parametrize("attention_granularity", ["layer", "feature"])
+def test_site_token_baseline_gives_each_site_its_own_query(
+    attention_granularity,
+):
+    layer_features = torch.randn(3, 2, ENCODER_DIM)
+    model = build_model(
+        SiteTokenBaselineModel,
+        0.0,
+        attention_granularity=attention_granularity,
+        n_attention_heads=2,
+    ).eval()
+    predictions, attention = model(layer_features, use_precomputed_features=True)
+
+    # Attention keeps a site axis: [B, T/R, N, L(, E)].
+    assert predictions.shape == (3, 5, 4)
+    assert attention.shape[:4] == (3, 5, 4, 2)
+
+    # Identical site tokens must give identical site predictions, so any
+    # difference between sites comes only from the tokens.
+    with torch.no_grad():
+        model.site_embeddings.copy_(model.site_embeddings[:1].expand(4, -1))
+    # end with no gradient tracking
+    tied_predictions, _ = model(layer_features, use_precomputed_features=True)
+    torch.testing.assert_close(
+        tied_predictions,
+        tied_predictions[..., :1].expand_as(tied_predictions),
+    )
+    assert not torch.allclose(predictions, tied_predictions)
 # EOF

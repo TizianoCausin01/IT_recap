@@ -1194,6 +1194,138 @@ class TemporalNoiseBaselineModel(BaselineModel):
 # EOC
 
 
+class SiteTokenBaselineModel(BaselineModel):
+    """
+    BaselineModel that predicts every recording site separately, telling the
+    shared decoder which site it is predicting through a learned site token.
+
+    The query for coarse time block t and site n is the sum of the temporal
+    embedding and the site embedding, q_tn = e_t + s_n, so every (time, site)
+    pair selects its own mixture of ANN layers or features. All attention,
+    MLP, and readout weights are shared across sites; each time bin keeps its
+    own readout head, which now maps one site latent to one scalar. Compared
+    with BaselineModel, the site population is no longer read out jointly
+    from one latent per time bin.
+
+    INPUT (forward):
+        - x: torch.Tensor -> images or cached features
+        - use_precomputed_features: bool -> whether x is [batch, layers, embedding]
+
+    OUTPUT:
+        - neural_predictions: torch.Tensor -> activity [batch, time, neurons]
+        - attention_weights: torch.Tensor -> weights [B, T/R, N, L] or
+          [B, T/R, N, L, E], depending on attention_granularity
+    """
+
+    """
+    __init__
+    Build a one-output BaselineModel decoder and add one token per site.
+
+    INPUT:
+        - encoder: imgANN -> wrapped frozen image encoder
+        - layers: list[str] -> ordered hooked ANN layers
+        - n_neurons: int -> number of recording sites, i.e. site tokens
+        - baseline_kwargs: dict -> remaining BaselineModel arguments
+
+    OUTPUT:
+        - None
+    """
+    def __init__(self, encoder, layers, n_neurons, **baseline_kwargs):
+        # Each readout head predicts a single site, so it has one output.
+        super().__init__(encoder, layers, n_neurons=1, **baseline_kwargs)
+        self.n_neurons = n_neurons
+        # Same initialization scale as the temporal embeddings: [N, E_te].
+        self.site_embeddings = nn.Parameter(
+            torch.randn(n_neurons, self.temporal_embedding_dim) * 0.02
+        )
+
+    """
+    _build_temporal_queries
+    Combine every temporal embedding with every site token.
+
+    INPUT:
+        - batch_size: int -> number of images in the current forward pass
+
+    OUTPUT:
+        - queries: torch.Tensor -> queries [batch, (T/R) * N, key_dim],
+          time-major so that query index = t * N + n
+    """
+    def _build_temporal_queries(self, batch_size):
+        # [T/R, 1, E_te] + [1, N, E_te] -> [T/R, N, E_te] -> [(T/R) * N, E_te].
+        site_queries = (
+            self.temporal_embeddings[:, None, :]
+            + self.site_embeddings[None, :, :]
+        ).flatten(0, 1)
+        site_queries = site_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        site_queries = self.temporal_embedding_dropout(site_queries)
+        if hasattr(self, "query_projection"):
+            return self.query_projection(site_queries)
+        # end if site queries require projection
+        return site_queries
+    # EOF
+
+    def forward(self, x, use_precomputed_features=False):
+        layer_features = self._resolve_layer_features(
+            x,
+            use_precomputed_features,
+        )
+        batch_size = layer_features.shape[0]
+        queries = self._build_temporal_queries(batch_size)
+
+        # The attention helpers are agnostic to the query count, so they
+        # return one latent per (time block, site): [B, (T/R) * N, V].
+        if self.attention_granularity == "layer":
+            coarse_latents, attention_weights = self._compute_layer_attention(
+                layer_features,
+                queries,
+            )
+        else:
+            coarse_latents, attention_weights = self._compute_feature_attention(
+                layer_features,
+                queries,
+            )
+        # end if attention operates over layers or embedding features
+
+        # [B, (T/R) * N, V] -> [B, T/R, N, R * V] -> [B, T/R, N, R, V].
+        fine_latent_blocks = self.temporal_feature_mlp(coarse_latents)
+        fine_latent_blocks = fine_latent_blocks.reshape(
+            batch_size,
+            self.n_temporal_embeddings,
+            self.n_neurons,
+            self.temporal_compression_ratio,
+            self.value_dim,
+        )
+        # Put the R fine bins next to their block before merging: [B, T, N, V].
+        fine_latents = fine_latent_blocks.permute(0, 1, 3, 2, 4).reshape(
+            batch_size,
+            self.n_timepoints,
+            self.n_neurons,
+            self.value_dim,
+        )
+        neural_features = self.neural_feature_mlp(fine_latents)
+
+        # Head t maps every site latent at bin t to that site's scalar.
+        timebin_predictions = []
+        for timebin, timebin_readout in enumerate(self.timebin_readouts):
+            current_prediction = timebin_readout(
+                neural_features[:, timebin]
+            ).squeeze(-1)
+            timebin_predictions.append(current_prediction)
+        # end for time-bin-specific readout
+        neural_predictions = torch.stack(timebin_predictions, dim=1)
+
+        # Expose the site axis of the attention: [B, T/R, N, L(, E)].
+        attention_weights = attention_weights.reshape(
+            batch_size,
+            self.n_temporal_embeddings,
+            self.n_neurons,
+            *attention_weights.shape[2:],
+        )
+        return neural_predictions, attention_weights
+    # EOF
+# EOC
+
+
 class ShowAttendTellGRUModel(nn.Module):
     """
     Predict neural dynamics with recurrent attention over static ANN features.
