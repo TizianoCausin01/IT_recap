@@ -14,6 +14,15 @@ and three0, all fed the same mean-pooled DINOv3 layers:
     site_token      SiteTokenBaselineModel: the same decoder, but every site is
                     predicted separately from a query = time embedding + learned
                     site token, so sites share every weight except their token
+    site_token_single (optional, add it to --models) the same model trained on
+                    (image, site) pairs: each pass predicts one site's time
+                    course, and at inference the per-site passes of an image are
+                    stacked into the population vector. Sites never interact, so
+                    the function is identical; an epoch covers every pair, which
+                    gives N times more optimizer steps per epoch
+    site_token_matched (optional) the joint site_token model with batch size and
+                    epochs set so its number of optimizer updates and targets per
+                    update match site_token_single
 
 The SGD models train for a fixed number of epochs (100) and keep the epoch with
 the best validation R2. Test scores are reported per time bin as R2, mean
@@ -27,7 +36,7 @@ import copy
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import matplotlib
@@ -81,18 +90,25 @@ DATASETS = {
     "paul": ("paul", "230204", "fewer_occlusion"),
     "three0": ("three0", "250313", "talia_20each_tizi"),
 }
-MODELS = ("ridge_site", "ridge_timebin", "baseline", "site_token")
+MODELS = (
+    "ridge_site", "ridge_timebin", "baseline", "site_token",
+    "site_token_single", "site_token_matched",
+)
 MODEL_COLORS = {
     "ridge_site": "#2a78d6",
     "ridge_timebin": "#1baf7a",
     "baseline": "#eb6834",
     "site_token": "#8a4fd3",
+    "site_token_single": "#e34948",
+    "site_token_matched": "#6d6d6d",
 }
 MODEL_LABELS = {
     "ridge_site": "Ridge per bin & site",
     "ridge_timebin": "Ridge per bin (SGD, Frobenius)",
     "baseline": "Baseline attention",
     "site_token": "Baseline + site token",
+    "site_token_single": "Site token, one site per pass",
+    "site_token_matched": "Site token, joint, matched updates",
 }
 
 
@@ -101,6 +117,8 @@ class Cfg:
     env: str | None = None
     output_dir: str | None = None
     datasets: str = "paul,three0"
+    # Subset of MODELS to fit, score, and plot; ridge_site is the reference.
+    models: str = "ridge_site,ridge_timebin,baseline,site_token"
 
     # Neural target: trial-averaged natraster, as in the baseline notebooks.
     brain_area: str = "AIT"
@@ -145,6 +163,14 @@ class Cfg:
     # Shared optimization: fixed epoch budget, best validation R2 checkpoint.
     batch_size: int = 64
     epochs: int = 100
+    # site_token_matched: three0 has 466 fit images x 25 sites, so single-site
+    # training makes ceil(11650 / 64) * 100 = 18,200 updates of 64 targets.
+    # Batches of 3 images (75 targets) give 156 updates per epoch, and 117
+    # epochs give 18,252 updates.
+    matched_batch_size: int = 3
+    matched_epochs: int = 117
+    # Evaluation chunk size, independent of the training batch.
+    eval_batch_size: int = 64
 
     # Dynamic RSA settings of the notebooks.
     drsa_rdm_metric: str = "euclidean"
@@ -271,13 +297,23 @@ INPUT:
     - data: dict -> "train"/"validation"/"test" (features, targets) on device
     - cfg: Cfg -> epochs and batch size
     - seed: int -> shuffling seed
+    - train_batch: callable | None -> item indices -> (predictions, targets);
+      None trains on whole images, train_batch(b) = (predict(x[b]), y[b])
+    - n_train_items: int | None -> items per epoch for train_batch (default:
+      the number of training images)
 
 OUTPUT:
     - history: dict -> per-epoch objective, train/validation MSE, validation R2
     - best_epoch: int -> restored epoch (0 = initialization)
 """
-def train_decoder(model, predict, loss_fn, optimizer, data, cfg, seed):
+def train_decoder(
+    model, predict, loss_fn, optimizer, data, cfg, seed, train_batch=None, n_train_items=None
+):
     train_x, train_y = data["train"]
+    if train_batch is None:
+        train_batch = lambda batch: (predict(train_x[batch]), train_y[batch])
+        n_train_items = len(train_x)
+    # end if training items are whole images
     generator = torch.Generator().manual_seed(seed)
     zero_mean = np.zeros(train_y.shape[1:])  # targets are fit-split centered
 
@@ -287,7 +323,7 @@ def train_decoder(model, predict, loss_fn, optimizer, data, cfg, seed):
         with torch.no_grad():
             predictions = [
                 predict(chunk).cpu().numpy()
-                for chunk in data[split][0].split(cfg.batch_size)
+                for chunk in data[split][0].split(cfg.eval_batch_size)
             ]
         # end with no gradient tracking
         return np.concatenate(predictions)
@@ -305,11 +341,11 @@ def train_decoder(model, predict, loss_fn, optimizer, data, cfg, seed):
     best_state = copy.deepcopy(model.state_dict())
     for epoch in range(1, cfg.epochs + 1):
         model.train()
-        order = torch.randperm(len(train_x), generator=generator)
+        order = torch.randperm(n_train_items, generator=generator)
         epoch_loss = 0.0
         for start in range(0, len(order), cfg.batch_size):
             batch = order[start : start + cfg.batch_size].to(train_x.device)
-            loss = loss_fn(predict(train_x[batch]), train_y[batch], model)
+            loss = loss_fn(*train_batch(batch), model)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -443,11 +479,13 @@ INPUT:
     - data: dict -> torch tensors of the raw layers per split
     - shapes: tuple -> (n_layers, feature_dim, n_time, n_sites)
     - cfg, seed, device -> optimization settings
+    - single_site: bool -> train SiteTokenBaselineModel on (image, site) pairs
+      and predict populations by stacking one pass per site token
 
 OUTPUT:
     - run: dict -> train_decoder output
 """
-def fit_attention_model(model_class, data, shapes, cfg, seed, device):
+def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_site=False):
     torch.manual_seed(seed)
     model = model_class(
         CachedFeatureEncoder(shapes[1]),
@@ -467,14 +505,51 @@ def fit_attention_model(model_class, data, shapes, cfg, seed, device):
         lr=cfg.baseline_learning_rate,
         weight_decay=cfg.baseline_weight_decay,
     )
+    loss_fn = lambda predictions, targets, _: (predictions - targets).square().mean()
+    if not single_site:
+        return train_decoder(
+            model,
+            lambda features: model(features, use_precomputed_features=True)[0],
+            loss_fn,
+            optimizer,
+            data,
+            cfg,
+            seed,
+        )
+    # end if all sites are predicted in one pass
+
+    train_x, train_y = data["train"]
+    n_sites = shapes[3]
+
+    def train_batch(pair_indices):
+        # Pair k = (image k // N, site k % N): one site's [T] time course each.
+        image_indices, site_indices = pair_indices // n_sites, pair_indices % n_sites
+        predictions = model(
+            train_x[image_indices], use_precomputed_features=True, site_indices=site_indices
+        )[0]
+        return predictions, train_y[image_indices, :, site_indices]
+    # EOF
+
+    def predict_population(features):
+        # One pass per site token, stacked over sites: [B, T, N].
+        return torch.stack(
+            [
+                model(
+                    features,
+                    use_precomputed_features=True,
+                    site_indices=torch.full(
+                        (len(features),), site, dtype=torch.long, device=features.device
+                    ),
+                )[0]
+                for site in range(n_sites)
+            ],
+            dim=-1,
+        )
+    # EOF
+
     return train_decoder(
-        model,
-        lambda features: model(features, use_precomputed_features=True)[0],
-        lambda predictions, targets, _: (predictions - targets).square().mean(),
-        optimizer,
-        data,
-        cfg,
-        seed,
+        model, predict_population, loss_fn, optimizer, data, cfg, seed,
+        train_batch=train_batch, n_train_items=len(train_x) * n_sites,
     )
 # EOF
 
@@ -514,7 +589,7 @@ def run_split(cfg, seed, targets, ann_index, features, device, run_dir):
         }
     # EOF
 
-    for name in MODELS:
+    for name in cfg.models.split(","):
         run_path = run_dir / f"seed{seed}_{name}.npz"
         if run_path.is_file():
             continue
@@ -529,7 +604,16 @@ def run_split(cfg, seed, targets, ann_index, features, device, run_dir):
             )
         else:
             model_class = BaselineModel if name == "baseline" else SiteTokenBaselineModel
-            run = fit_attention_model(model_class, tensors(features), shapes, cfg, seed, device)
+            model_cfg = cfg
+            if name == "site_token_matched":
+                model_cfg = replace(
+                    cfg, batch_size=cfg.matched_batch_size, epochs=cfg.matched_epochs
+                )
+            # end if the update count must match the single-site run
+            run = fit_attention_model(
+                model_class, tensors(features), shapes, model_cfg, seed, device,
+                single_site=name == "site_token_single",
+            )
         # end if closed-form ridge, SGD ridge, or attention model
         np.savez_compressed(run_path, **run)
         best = f" | best epoch {run['best_epoch']}" if "best_epoch" in run else ""
@@ -558,7 +642,7 @@ def score_split(cfg, seed, targets, ann_index, run_dir):
     )
 
     scores = {}
-    for name in MODELS:
+    for name in cfg.models.split(","):
         run = dict(np.load(run_dir / f"seed{seed}_{name}.npz"))
         predictions = run["test_predictions"]
         prediction_rdms = prepared_rdm_time_series(
@@ -594,7 +678,7 @@ def plot_dataset(cfg, dataset_name, all_scores, output_path):
     figure, axes = plt.subplots(1, 4, figsize=(22, 5))
 
     # Panel 1: train (dashed) and validation (solid) MSE, mean over splits.
-    for name in MODELS[1:]:
+    for name in cfg.models.split(",")[1:]:
         for key, style in (("validation_mse_curve", "-"), ("train_mse_curve", "--")):
             curves = pad_curves([scores[name][key] for scores in all_scores])
             axes[0].plot(np.arange(1, curves.shape[1] + 1), np.nanmean(curves, axis=0),
@@ -615,7 +699,7 @@ def plot_dataset(cfg, dataset_name, all_scores, output_path):
         ("rsa_by_bin", f"{cfg.drsa_rsa_metric} RDM correlation", "RSA per time bin"),
     )
     for axis, (key, ylabel, title) in zip(axes[1:], panels):
-        for name in MODELS:
+        for name in cfg.models.split(","):
             values = np.stack([scores[name][key] for scores in all_scores])
             mean = np.nanmean(values, axis=0)
             sem = np.nanstd(values, axis=0) / np.sqrt(len(values))
@@ -669,7 +753,7 @@ def main():
         plot_dataset(cfg, dataset_name, all_scores,
                      output_root / dataset_name / "four_model_comparison.png")
         summary[dataset_name] = {}
-        for name in MODELS:
+        for name in cfg.models.split(","):
             pooled = np.array([scores[name]["r2"] for scores in all_scores])
             summary[dataset_name][name] = {
                 "test_r2": float(pooled.mean()),
