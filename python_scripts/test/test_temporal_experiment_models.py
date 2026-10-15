@@ -69,3 +69,43 @@ def test_attention_models_normalize_the_attention_axis():
         assert torch.allclose(attention_sum, torch.ones_like(attention_sum))
     # end for attention model
 # EOF
+
+
+def test_timebin_linear_regression_optimum_is_ridge():
+    # With lambda = alpha / N, N times the Frobenius loss is sklearn's ridge
+    # objective, so the converged per-bin map must reproduce Ridge(alpha).
+    import numpy as np
+    from sklearn.linear_model import Ridge
+
+    from model_classes.temporal_experiment_models import TimebinLinearRegression
+
+    n_images, n_layers, feature_dim, n_time, n_units, alpha = 40, 2, 8, 3, 4, 5.0
+    generator = torch.Generator().manual_seed(0)
+    features = torch.randn(n_images, n_layers, feature_dim, generator=generator)
+    targets = torch.randn(n_images, n_time, n_units, generator=generator)
+    model = TimebinLinearRegression(n_layers, feature_dim, n_time, n_units)
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        max_iter=500,
+        tolerance_grad=1e-10,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure():
+        optimizer.zero_grad()
+        frobenius = (model(features)[0] - targets).square().sum(dim=(1, 2)).mean()
+        loss = frobenius + alpha / n_images * model.weight.square().sum()
+        loss.backward()
+        return loss
+    # EOF
+
+    for _ in range(5):
+        optimizer.step(closure)
+    # end for LBFGS restart
+    flat_features = features.reshape(n_images, -1).numpy()
+    ridge_predictions = Ridge(alpha=alpha).fit(
+        flat_features, targets.reshape(n_images, -1).numpy()
+    ).predict(flat_features)
+    model_predictions = model(features)[0].detach().reshape(n_images, -1).numpy()
+    assert np.abs(model_predictions - ridge_predictions).max() < 1e-3
+# EOF

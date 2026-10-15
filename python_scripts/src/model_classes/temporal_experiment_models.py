@@ -630,8 +630,47 @@ class TemporalTransformerDecoder(CachedFeatureTemporalModel):
 # EOC
 
 
+class TimebinLinearRegression(CachedFeatureTemporalModel):
+    """
+    One independent linear map per time bin from the concatenated layers to the
+    whole population -- the same parameterization as a flattened-output ridge.
+
+    Bin t predicts all neurons jointly as y_t = x W_t + b_t, with W_t of shape
+    [layers * embedding, neurons]. Nothing is shared across bins, so the model
+    has exactly ridge's coefficient count; it differs from ridge only in being
+    fitted by SGD on a Frobenius-norm loss. Weights start at zero so that,
+    without a penalty, SGD drifts out from the minimum-norm solution.
+
+    Features are NOT normalized per image: the caller passes the same
+    fit-split z-scored design matrix that ridge receives.
+    """
+
+    def __init__(self, n_layers, feature_dim, n_timepoints, n_neurons, **_):
+        super().__init__(
+            n_layers,
+            feature_dim,
+            n_timepoints,
+            n_neurons,
+            normalize_features=False,
+        )
+        input_dim = n_layers * feature_dim
+        # W: [time, inputs, neurons], b: [time, neurons].
+        self.weight = nn.Parameter(torch.zeros(n_timepoints, input_dim, n_neurons))
+        self.bias = nn.Parameter(torch.zeros(n_timepoints, n_neurons))
+
+    def forward(self, layer_features, return_diagnostics=False):
+        flat_features = self._normalized_features(layer_features).flatten(1)
+        # [B, D] x [T, D, N] -> [B, T, N]: every bin applies its own map.
+        predictions = torch.einsum("bd,tdn->btn", flat_features, self.weight)
+        diagnostics = {"weight_norm": self.weight.norm()} if return_diagnostics else None
+        return predictions + self.bias, diagnostics
+    # EOF
+# EOC
+
+
 MODEL_CLASSES = {
     "low_rank_linear": LowRankLinearDecoder,
+    "timebin_linear": TimebinLinearRegression,
     "time_mlp": TimeConditionedMLP,
     "autonomous_gru": AutonomousGRUDecoder,
     "repeated_gru": RepeatedInputGRUDecoder,
