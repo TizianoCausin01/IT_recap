@@ -89,6 +89,7 @@ from run_three0_linear_readout_comparison import (  # noqa: E402
 DATASETS = {
     "paul": ("paul", "230204", "fewer_occlusion"),
     "three0": ("three0", "250313", "talia_20each_tizi"),
+    "baby1": ("baby1", "220226to527", "manyOO"),
 }
 MODELS = (
     "ridge_site", "ridge_timebin", "baseline", "site_token",
@@ -171,6 +172,8 @@ class Cfg:
     matched_epochs: int = 117
     # Evaluation chunk size, independent of the training batch.
     eval_batch_size: int = 64
+    # Print the validation scores every this many epochs (0 = silent).
+    print_every: int = 0
 
     # Dynamic RSA settings of the notebooks.
     drsa_rdm_metric: str = "euclidean"
@@ -360,6 +363,10 @@ def train_decoder(
             best_r2, best_epoch = validation_r2, epoch
             best_state = copy.deepcopy(model.state_dict())
         # end if this epoch is the best checkpoint
+        if cfg.print_every and epoch % cfg.print_every == 0:
+            print(f"    epoch {epoch:4d} | validation MSE {validation_mse:.5f} | "
+                  f"R2 {validation_r2:.4f} | best {best_r2:.4f} @ {best_epoch}", flush=True)
+        # end if progress should be printed
     # end for epoch
     model.load_state_dict(best_state)
 
@@ -470,24 +477,21 @@ def fit_ridge_timebin(design, centered, splits, alphas, data, shapes, cfg, seed,
 
 
 """
-fit_attention_model
-Train BaselineModel or SiteTokenBaselineModel on raw cached layer vectors with
-the notebooks' time-bin MSE loss and AdamW weight decay.
+build_attention_model
+Construct an untrained BaselineModel or SiteTokenBaselineModel that reads
+cached layer vectors, so DINOv3 is never loaded.
 
 INPUT:
     - model_class: type -> BaselineModel or SiteTokenBaselineModel
-    - data: dict -> torch tensors of the raw layers per split
     - shapes: tuple -> (n_layers, feature_dim, n_time, n_sites)
-    - cfg, seed, device -> optimization settings
-    - single_site: bool -> train SiteTokenBaselineModel on (image, site) pairs
-      and predict populations by stacking one pass per site token
+    - cfg: Cfg -> decoder hyperparameters
+    - device: torch.device -> compute device
 
 OUTPUT:
-    - run: dict -> train_decoder output
+    - model: nn.Module -> decoder on the device
 """
-def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_site=False):
-    torch.manual_seed(seed)
-    model = model_class(
+def build_attention_model(model_class, shapes, cfg, device):
+    return model_class(
         CachedFeatureEncoder(shapes[1]),
         layers=cfg.layer_names.split(","),
         temporal_embedding_dim=cfg.temporal_embedding_dim,
@@ -500,6 +504,33 @@ def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_sit
         attention_granularity=cfg.attention_granularity,
         n_attention_heads=cfg.n_attention_heads,
     ).to(device)
+# EOF
+
+
+"""
+fit_attention_model
+Train BaselineModel or SiteTokenBaselineModel on raw cached layer vectors with
+the notebooks' time-bin MSE loss and AdamW weight decay.
+
+INPUT:
+    - model_class: type -> BaselineModel or SiteTokenBaselineModel
+    - data: dict -> torch tensors of the raw layers per split
+    - shapes: tuple -> (n_layers, feature_dim, n_time, n_sites)
+    - cfg, seed, device -> optimization settings
+    - single_site: bool -> train SiteTokenBaselineModel on (image, site) pairs
+      and predict populations by stacking one pass per site token
+    - return_model: bool -> also return the trained (best-checkpoint) model,
+      e.g. to inspect its attention maps
+
+OUTPUT:
+    - run: dict -> train_decoder output
+    - model: nn.Module -> only when return_model is True
+"""
+def fit_attention_model(
+    model_class, data, shapes, cfg, seed, device, single_site=False, return_model=False
+):
+    torch.manual_seed(seed)
+    model = build_attention_model(model_class, shapes, cfg, device)
     optimizer = torch.optim.AdamW(
         model.get_trainable_parameters(),
         lr=cfg.baseline_learning_rate,
@@ -507,7 +538,7 @@ def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_sit
     )
     loss_fn = lambda predictions, targets, _: (predictions - targets).square().mean()
     if not single_site:
-        return train_decoder(
+        run = train_decoder(
             model,
             lambda features: model(features, use_precomputed_features=True)[0],
             loss_fn,
@@ -516,6 +547,7 @@ def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_sit
             cfg,
             seed,
         )
+        return (run, model) if return_model else run
     # end if all sites are predicted in one pass
 
     train_x, train_y = data["train"]
@@ -547,10 +579,52 @@ def fit_attention_model(model_class, data, shapes, cfg, seed, device, single_sit
         )
     # EOF
 
-    return train_decoder(
+    run = train_decoder(
         model, predict_population, loss_fn, optimizer, data, cfg, seed,
         train_batch=train_batch, n_train_items=len(train_x) * n_sites,
     )
+    return (run, model) if return_model else run
+# EOF
+
+
+"""
+prepare_split
+Make one image split, center the targets on its fit images, and move every
+split to the device.
+
+INPUT:
+    - cfg: Cfg -> split fractions
+    - seed: int -> split seed
+    - targets, ann_index, features -> load_dataset output
+    - device: torch.device -> compute device
+
+OUTPUT:
+    - splits: dict -> row indices per split
+    - centered: np.ndarray -> [images, time, sites] fit-centered targets
+    - design: np.ndarray -> [images, layers * embedding] fit-z-scored features
+    - to_tensors: callable -> inputs [images, ...] -> {split: (x, y)} on device
+"""
+def prepare_split(cfg, seed, targets, ann_index, features, device):
+    splits = make_image_splits(ann_index, seed, cfg.validation_fraction, cfg.test_fraction)
+
+    # Center targets on the fit split, per (time, site), as the notebooks do.
+    centered = targets - targets[splits["train"]].mean(0)
+
+    # Linear models see the fit-split z-scored flat design; the attention
+    # models see raw layer vectors and normalize them internally.
+    flat = features.reshape(len(features), -1)
+    design = (flat - flat[splits["train"]].mean(0)) / (flat[splits["train"]].std(0) + 1e-6)
+
+    def to_tensors(inputs):
+        return {
+            split: (
+                torch.as_tensor(inputs[rows], device=device),
+                torch.as_tensor(centered[rows], device=device),
+            )
+            for split, rows in splits.items()
+        }
+    # EOF
+    return splits, centered, design, to_tensors
 # EOF
 
 
@@ -566,28 +640,11 @@ INPUT:
     - run_dir: Path -> per-run output directory
 """
 def run_split(cfg, seed, targets, ann_index, features, device, run_dir):
-    splits = make_image_splits(ann_index, seed, cfg.validation_fraction, cfg.test_fraction)
-    n_images, n_layers, feature_dim = features.shape
-    shapes = (n_layers, feature_dim, *targets.shape[1:])
-
-    # Center targets on the fit split, per (time, site), as the notebooks do.
-    centered = targets - targets[splits["train"]].mean(0)
-
-    # Linear models see the fit-split z-scored flat design; the attention
-    # models see raw layer vectors and normalize them internally.
-    flat = features.reshape(n_images, -1)
-    design = (flat - flat[splits["train"]].mean(0)) / (flat[splits["train"]].std(0) + 1e-6)
+    splits, centered, design, tensors = prepare_split(
+        cfg, seed, targets, ann_index, features, device
+    )
+    shapes = (*features.shape[1:], *targets.shape[1:])
     alphas = np.logspace(cfg.ridge_alpha_min_exp, cfg.ridge_alpha_max_exp, cfg.ridge_n_alphas)
-
-    def tensors(inputs):
-        return {
-            split: (
-                torch.as_tensor(inputs[rows], device=device),
-                torch.as_tensor(centered[rows], device=device),
-            )
-            for split, rows in splits.items()
-        }
-    # EOF
 
     for name in cfg.models.split(","):
         run_path = run_dir / f"seed{seed}_{name}.npz"
